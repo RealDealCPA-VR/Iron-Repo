@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iron-repo"
+version = "0.1.0"
+description = "Turn any storage you control (OneDrive, Google Drive, Dropbox, Box, S3, a NAS, a USB disk) into a private Git remote."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+crypto = ["cryptography>=3.4"]
+test = ["pytest>=7"]
+
+[project.scripts]
+iron = "iron.cli:main"
+git-remote-iron = "iron.remote_helper:main"
+
+[tool.setuptools.packages.find]
+include = ["iron*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
