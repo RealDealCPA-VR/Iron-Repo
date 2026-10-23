@@ -2,12 +2,14 @@
 
 1. If rclone is missing, offer to download the official build from
    downloads.rclone.org, check it against the published SHA256SUMS and keep
-   only the rclone binary in ``<IRON_HOME>/bin`` (always asks first).
+   only the rclone binary in ``<IRON_HOME>/bin`` (always asks first, and sends
+   no request at all before the answer is yes).
 2. ``rclone config create <name> <type>``. For OAuth providers rclone opens the
    browser and keeps the token in its own config on this computer; Iron never
    sees it.
 3. Run the provider compliance suite against ``<name>:Iron-Repos/.connect-check``
-   and say in plain words whether the storage behaves.
+   and say in plain words whether the storage behaves. The check folder is
+   removed afterwards, and ``Iron-Repos`` too if the check created it.
 
 A user's own rclone on PATH (or IRON_RCLONE) is used as is; nothing is downloaded.
 """
@@ -34,12 +36,14 @@ from .cli import BAD, OK, ask, cmd_setup, confirm, interactive, say
 from .errors import IronError
 from .storage import open_location
 from .storage.compliance import run_compliance
-from .storage.rclone import installed_rclone, rclone_available, rclone_command
+from .storage.base import NotFound, StorageError
+from .storage.rclone import installed_rclone, rclone_available, rclone_command, run_rclone
 
 DOWNLOAD_BASE = "https://downloads.rclone.org"
 MAX_ZIP_BYTES = 200 * 1024 * 1024
 MAX_BINARY_BYTES = 400 * 1024 * 1024
-CHECK_FOLDER = "Iron-Repos/.connect-check"
+REPOS_FOLDER = "Iron-Repos"
+CHECK_FOLDER = REPOS_FOLDER + "/.connect-check"
 
 
 @dataclass
@@ -165,15 +169,6 @@ def _fetch_text(url, limit=1024 * 1024):
         return r.read(limit).decode("utf-8", errors="replace")
 
 
-def _remote_size(url):
-    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "iron/%s" % __version__})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return int(r.headers.get("Content-Length") or 0) or None
-    except (urllib.error.URLError, OSError, ValueError):
-        return None
-
-
 def latest_version(base):
     text = _fetch_text(base + "/version.txt").strip()
     m = VERSION_RE.match(text)
@@ -190,7 +185,13 @@ def expected_sha256(sums_text, filename):
     raise IronError("%s is not listed in the published SHA256SUMS, so it cannot be verified" % filename)
 
 
+def release_url(base, version, system, arch):
+    """The versioned zip, the one SHA256SUMS lists (not rclone-current-*, which can move under us)."""
+    return "%s/v%s/rclone-v%s-%s-%s.zip" % (base, version, version, system, arch)
+
+
 def _download(url, dest):
+    """Save ``url`` to ``dest``; returns (sha256 hex, size in bytes)."""
     digest, size = hashlib.sha256(), 0
     with _open(url) as r, open(dest, "wb") as f:
         while True:
@@ -202,7 +203,7 @@ def _download(url, dest):
                 raise IronError("the download is larger than expected; stopped")
             digest.update(chunk)
             f.write(chunk)
-    return digest.hexdigest()
+    return digest.hexdigest(), size
 
 
 def _extract_binary(zip_path, dest):
@@ -226,35 +227,37 @@ def _extract_binary(zip_path, dest):
 
 def install_rclone(assume_yes=False):
     """Download, verify and install rclone into <IRON_HOME>/bin. Returns the binary's path."""
+    # Nothing goes over the network before the user says yes: no HEAD, no version.txt.
     base = download_base()
     system, arch = platform_tag()
-    url = "%s/rclone-current-%s-%s.zip" % (base, system, arch)
     dest = installed_rclone()
-    say("rclone is not installed. Iron can download the official build:")
-    say("  %s" % url)
+    say("rclone is not installed. Iron can download the official build for %s-%s:" % (system, arch))
+    say("  %s" % release_url(base, "<version>", system, arch))
+    say("  where <version> is the current release, read from %s/version.txt" % base)
+    say("  checked against %s/v<version>/SHA256SUMS; installs only the rclone program, into %s"
+        % (base, os.path.dirname(dest)))
     if not assume_yes and not interactive():
         raise IronError("not downloading without your go-ahead. Run `iron connect --yes ...` to allow it, "
                         "or install rclone yourself from https://rclone.org/install/")
-    size = _remote_size(url)
-    say("  size: %s, checked against the SHA256SUMS published by rclone" %
-        ("%.1f MB" % (size / 1048576.0) if size else "unknown"))
-    say("  installs only the rclone program, into %s" % os.path.dirname(dest))
     if not confirm("Download rclone now?", default=False, assume_yes=assume_yes):
         raise IronError("rclone is needed for a direct connection. Install it from https://rclone.org/install/ "
                         "or use a desktop sync folder instead (`iron setup --to onedrive`).")
+    # version.txt first, then the zip and its checksum from that same release folder,
+    # so a release published in between cannot cause a spurious mismatch.
     version = latest_version(base)
+    url = release_url(base, version, system, arch)
     sums = _fetch_text("%s/v%s/SHA256SUMS" % (base, version))
-    expected = expected_sha256(sums, "rclone-v%s-%s-%s.zip" % (version, system, arch))
+    expected = expected_sha256(sums, url.rsplit("/", 1)[-1])
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     fd, zip_path = tempfile.mkstemp(prefix=".rclone-download-", suffix=".zip", dir=os.path.dirname(dest))
     os.close(fd)
     try:
-        say("Downloading rclone v%s..." % version)
-        actual = _download(url, zip_path)
+        say("Downloading rclone v%s from %s ..." % (version, url))
+        actual, size = _download(url, zip_path)
         if actual != expected:
             raise IronError("the rclone download does not match its published checksum (expected %s, got %s). "
                             "Nothing was installed." % (expected, actual))
-        say("%s Checksum verified (SHA-256 %s)" % (OK, actual))
+        say("%s Checksum verified (%.1f MB, SHA-256 %s)" % (OK, size / 1048576.0, actual))
         _extract_binary(zip_path, dest)
     finally:
         for leftover in (zip_path, dest + ".partial"):
@@ -338,12 +341,33 @@ def create_remote(provider, name, a):
     say("%s rclone remote %r is set up (%s)" % (OK, name, provider.label))
 
 
+def _folder_exists(target):
+    """Whether an rclone folder exists. Unknown (an error) counts as yes, so it is never removed."""
+    try:
+        run_rclone(["lsf", "--max-depth", "1", target])
+        return True
+    except NotFound:
+        return False
+    except StorageError:
+        return True
+
+
 def check_remote(target):
-    """Run the compliance suite; return True when every check passed."""
+    """Run the compliance suite; return True when every check passed.
+
+    ``target`` is ``<remote>:[bucket/]Iron-Repos/.connect-check``. The suite removes its own
+    ``iron-compliance-*`` folder; then the check folder goes, and ``Iron-Repos`` too if the
+    check created it (``rclone rmdir`` only ever removes an empty folder)."""
     say("Checking that %s behaves like reliable storage (writes a few test files, then removes them)..." % target)
+    parent = target.rsplit("/", 1)[0] if target.endswith("/.connect-check") else None
+    parent_existed = _folder_exists(parent) if parent else True
     provider = open_location("rclone:" + target)
-    results = run_compliance(provider)
-    provider.remove_dir("")
+    try:
+        results = run_compliance(provider)
+    finally:
+        provider.remove_dir("")
+        if not parent_existed:
+            open_location("rclone:" + parent).remove_dir("")
     failed = [r for r in results if not r[1]]
     for check, passed, detail in results:
         words = PLAIN.get(check, check)
