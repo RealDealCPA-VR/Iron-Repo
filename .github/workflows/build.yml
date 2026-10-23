@@ -18,14 +18,14 @@ jobs:
           - target: macos-arm64
             os: macos-latest
           - target: linux-x64
-            os: ubuntu-latest
+            os: ubuntu-22.04  # oldest glibc available (2.35): the binary runs there and on anything newer
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -37,6 +37,16 @@ jobs:
 
       - name: Smoke test the executables
         run: sh packaging/smoke.sh dist/standalone
+
+      - name: Smoke test on a Linux with git but no Python at all
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w debian:stable-slim sh -c '
+            set -e
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends git >/dev/null
+            if command -v python3 || command -v python; then echo "this image has Python" >&2; exit 1; fi
+            sh packaging/smoke.sh dist/standalone'
 
       # Artifacts are zipped without Unix permissions, so macOS/Linux builds travel as a
       # tarball that keeps the executable bit.
@@ -50,7 +60,7 @@ jobs:
           fi
           ls -l dist/standalone dist/upload
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: iron-${{ matrix.target }}
           path: dist/upload/
