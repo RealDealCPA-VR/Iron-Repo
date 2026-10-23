@@ -1,0 +1,67 @@
+name: Standalone executables
+
+on:
+  push:
+    branches: [ci/portability]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x64
+            os: windows-latest
+          - target: macos-arm64
+            os: macos-latest
+          - target: linux-x64
+            os: ubuntu-22.04  # oldest glibc available (2.35): the binary runs there and on anything newer
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: python -m pip install pyinstaller cryptography
+
+      - name: Build
+        run: python packaging/build.py
+
+      - name: Smoke test the executables
+        run: sh packaging/smoke.sh dist/standalone
+
+      - name: Smoke test on a Linux with git but no Python at all
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w debian:stable-slim sh -c '
+            set -e
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends git >/dev/null
+            if command -v python3 || command -v python; then echo "this image has Python" >&2; exit 1; fi
+            sh packaging/smoke.sh dist/standalone'
+
+      # Artifacts are zipped without Unix permissions, so macOS/Linux builds travel as a
+      # tarball that keeps the executable bit.
+      - name: Package
+        run: |
+          mkdir -p dist/upload
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp dist/standalone/* dist/upload/
+          else
+            tar -czf "dist/upload/iron-${{ matrix.target }}.tar.gz" -C dist/standalone iron git-remote-iron
+          fi
+          ls -l dist/standalone dist/upload
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: iron-${{ matrix.target }}
+          path: dist/upload/
+          if-no-files-found: error

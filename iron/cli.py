@@ -726,7 +726,8 @@ def cmd_doctor(a):
         good = good and (ok or optional)
         say("%s %s" % (OK if ok else ("o" if optional else BAD), text))
 
-    line(sys.version_info >= (3, 8), "Python %s" % sys.version.split()[0])
+    line(sys.version_info >= (3, 8), "Python %s%s" % (sys.version.split()[0],
+         " (built into this standalone iron)" if getattr(sys, "frozen", False) else ""))
     try:
         v = gitutil.git_version()
         line(v >= gitutil.MIN_GIT, "git %s (needs %d.%d or newer)" % (".".join(map(str, v)), *gitutil.MIN_GIT)

@@ -64,6 +64,11 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def recover_source():
+    """The text of recover.py. A standalone build ships it as a data file beside its compiled module."""
+    return Path(recover.__file__).with_suffix(".py").read_bytes()
+
+
 @dataclass
 class State:
     tip: str = None
@@ -162,8 +167,8 @@ class RemoteRepo:
                                 % (existing.get("object_format"), object_format))
             if existing.get("version", 1) == recover.FORMAT_VERSION:
                 try:  # keep the bundled recovery tool current
-                    if self.store.read("iron-recover.py") != Path(recover.__file__).read_bytes():
-                        self.store.write("iron-recover.py", Path(recover.__file__).read_bytes())
+                    if self.store.read("iron-recover.py") != recover_source():
+                        self.store.write("iron-recover.py", recover_source())
                 except StorageError:
                     pass
             return existing, None
@@ -179,7 +184,7 @@ class RemoteRepo:
         self.store.write("README.txt", README.format(
             repo_id=marker["repo_id"], created=marker["created"],
             encryption="AES-256-GCM (keep your recovery key safe)" if encrypt else "none").encode())
-        self.store.write("iron-recover.py", Path(recover.__file__).read_bytes())
+        self.store.write("iron-recover.py", recover_source())
         marker["claims"] = self.store.supports_exclusive() if claims is None else bool(claims)
         self.store.write(MARKER, json.dumps(marker, indent=2).encode())  # last: marks the container complete
         self.open()
@@ -312,7 +317,9 @@ class RemoteRepo:
                     or os.environ.get("USER", "?"), "pid": os.getpid(), "created": now_iso(), "ttl": LOCK_TTL}
             self.store.write("locks/" + token, json.dumps(body).encode())
             live = self.live_locks()
-            if not live or live[0] == token:
+            # The oldest lock wins. A tie in the same millisecond is "busy" for this caller: the
+            # other one may already have listed, seen only itself and taken the lock.
+            if not live or (live[0] == token and not any(n[:13] == token[:13] for n in live[1:])):
                 break
             self.store.delete("locks/" + token)
             if time.monotonic() > deadline:

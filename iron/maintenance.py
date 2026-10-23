@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import gitutil, recover
 from .errors import IntegrityError, IronError, PushRejected
-from .remote import RemoteRepo, now_iso
+from .remote import RemoteRepo, now_iso, recover_source
 from .remote_helper import cache_dir_for
 from .storage import AlreadyExists, NotFound
 from .sync import apply_bundles, load_json, make_bundle, save_json
@@ -147,7 +147,7 @@ def migrate(src, dst_location, log=lambda m: None):
         pass
     # Always ship this version's recovery tool: the source's copy may predate the
     # destination's format (claims mode) and would silently rebuild stale history.
-    dst.store.write("iron-recover.py", Path(recover.__file__).read_bytes())
+    dst.store.write("iron-recover.py", recover_source())
     # The destination may or may not offer atomic claims: re-express the accepted
     # history in the destination's own commit style before writing its marker.
     dst_claims = dst.store.supports_exclusive()
