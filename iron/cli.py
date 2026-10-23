@@ -17,9 +17,10 @@ import uuid
 from datetime import date
 from pathlib import Path
 
-from . import __version__, checkpoint, gitutil, keys, locations, maintenance
+from . import __version__, checkpoint, gitutil, keys, locations, locks, maintenance
 from .crypto import crypto_available
 from .errors import IronError, KeyMissing
+from .locks import describe_agent
 from .remote import RemoteRepo
 from .remote_helper import cache_dir_for
 from .storage import rclone_available
@@ -263,14 +264,111 @@ def has_changes(cwd=None):
     return bool(gitutil.git("status", "--porcelain", cwd=cwd).strip())
 
 
-def commit_all(message, cwd=None, agent=None, session=None):
-    gitutil.git("add", "--all", cwd=cwd)
-    if not gitutil.run_git(["diff", "--cached", "--quiet"], cwd=cwd, check=False).returncode:
-        return None
-    lines = checkpoint.trailers(agent, session)
-    text = message + ("\n\n" + "\n".join(lines) if lines else "") + "\n"
-    gitutil.git("commit", "--quiet", "-F", "-", cwd=cwd, input=text, env=checkpoint.identity_env(cwd))
-    return gitutil.head_sha(cwd)
+UNMERGED = {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}
+
+
+def status_entries(root):
+    """[(XY, path)] from `git status --porcelain`, one entry per file."""
+    out = gitutil.run_git(["status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=root).stdout
+    parts = out.decode("utf-8", errors="replace").split("\0")
+    entries, i = [], 0
+    while i < len(parts):
+        item = parts[i]
+        i += 1
+        if len(item) < 4:
+            continue
+        xy, path = item[:2], item[3:]
+        if "R" in xy or "C" in xy:
+            i += 1  # the original name of a rename or copy follows
+        entries.append((xy, path))
+    return entries
+
+
+def _names(output):
+    return [p for p in output.decode("utf-8", errors="replace").split("\0") if p]
+
+
+def secret_files(root, paths):
+    """The paths (relative to ``root``) that look like secrets by name or content."""
+    out = []
+    for p in paths:
+        full = Path(root) / p
+        if full.is_file() and (looks_secret(p) or contains_private_key(full)):
+            out.append(p)
+    return out
+
+
+def unmerged_files(root):
+    """Files git still marks as conflicted (both sides changed them)."""
+    return _names(gitutil.run_git(["diff", "--name-only", "-z", "--diff-filter=U"], cwd=root, check=False).stdout)
+
+
+def conflict_banner(files):
+    shown = ", ".join(files[:8]) + (" ..." if len(files) > 8 else "")
+    return ("%s Files conflict between your computers: %s.\n"
+            "  Fix them, then `iron commit -am \"Combine changes\"` and `iron sync`." % (BAD, shown))
+
+
+def kept_out_line(files):
+    return "%d file(s) kept out because they look like secrets (add them to .gitignore): %s" % (
+        len(files), ", ".join(files[:6]) + (" ..." if len(files) > 6 else ""))
+
+
+class SecretsStaged(IronError):
+    """A file that looks like a secret was staged by hand; nothing is committed until it is unstaged."""
+
+    def __init__(self, paths):
+        self.paths = paths
+        super().__init__("not saving: %s %s staged and look%s like a secret. Unstage with "
+                         "`git restore --staged %s` (and add it to .gitignore)."
+                         % (", ".join(paths[:5]), "is" if len(paths) == 1 else "are",
+                            "s" if len(paths) == 1 else "", paths[0]))
+
+
+def kept_out(root, entries=None):
+    """Changed or new files that saving leaves out because they look like secrets."""
+    entries = status_entries(root) if entries is None else entries
+    return secret_files(root, [p for xy, p in entries if xy[:1] in (" ", "?")])
+
+
+def stage_changes(root, entries=None, allow_secrets=False):
+    """Stage every change except files that look like secrets. Returns the paths left out.
+
+    Shared by `iron agent`, the Python API, the dashboard and autosave. Raises
+    SecretsStaged if such a file was already staged by hand."""
+    staged = _names(gitutil.run_git(["diff", "--cached", "--name-only", "-z", "--diff-filter=d"], cwd=root).stdout)
+    if not allow_secrets:
+        risky_staged = secret_files(root, staged)
+        if risky_staged:
+            raise SecretsStaged(risky_staged)
+    entries = status_entries(root) if entries is None else entries
+    risky = [] if allow_secrets else secret_files(root, [p for _, p in entries if p not in staged])
+    spec = "\0".join(["."] + [":(exclude,literal)%s" % p for p in risky]) + "\0"
+    gitutil.run_git(["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"], cwd=root, input=spec)
+    return risky
+
+
+def commit_changes(message, cwd=None, agent=None, session=None, allow_secrets=False):
+    """Commit every change with attribution, leaving out files that look like secrets.
+
+    Returns {"sha": new sha or None if nothing changed, "left_out": [paths]}."""
+    root = gitutil.toplevel(cwd)
+    with locks.repo_lock(root, "saving a version"):
+        left_out = stage_changes(root, allow_secrets=allow_secrets)
+        if not gitutil.run_git(["diff", "--cached", "--quiet"], cwd=root, check=False).returncode:
+            return {"sha": None, "left_out": left_out}
+        lines = checkpoint.trailers(agent, session)
+        text = message + ("\n\n" + "\n".join(lines) if lines else "") + "\n"
+        gitutil.git("commit", "--quiet", "-F", "-", cwd=root, input=text, env=checkpoint.identity_env(root))
+        return {"sha": gitutil.head_sha(root), "left_out": left_out}
+
+
+def commit_all(message, cwd=None, agent=None, session=None, allow_secrets=False, log=None):
+    """Like commit_changes, but returns only the new sha (or None). ``log`` hears about left-out files."""
+    result = commit_changes(message, cwd=cwd, agent=agent, session=session, allow_secrets=allow_secrets)
+    if result["left_out"] and log:
+        log("%s %s" % (WARN, kept_out_line(result["left_out"])))
+    return result["sha"]
 
 
 # -- commands -----------------------------------------------------------------
@@ -307,9 +405,20 @@ def cmd_overview(_args):
             say("%s %s%s" % (DOT, item["subject"], agent))
             say("  %s" % item["when"])
             say()
-    pending = len([l for l in gitutil.git("status", "--porcelain", cwd=root).splitlines() if l.strip()])
+    entries = status_entries(root)
+    conflicts = unmerged_files(root)
+    secret = kept_out(root, entries)
+    pending = len([p for _, p in entries if p not in secret and p not in conflicts])
     cps = checkpoint.list_checkpoints(root)
+    if conflicts:
+        say(conflict_banner(conflicts))
+        say()
+    agent = locks.agent_session(root)
+    if agent:
+        say("%s %s is working here; autosave and background sync wait until it finishes." % (DOT, describe_agent(agent)))
     say("%d uncommitted change(s) - %d checkpoint(s)" % (pending, len(cps)))
+    if secret:
+        say("%s %s" % (WARN, kept_out_line(secret)))
     say()
     say("[ iron changes ] [ iron history ] [ iron sync ] [ iron where ]")
     return 0
@@ -377,6 +486,13 @@ def cmd_remote(argv):
 
 
 def cmd_setup(a):
+    here = Path(".").resolve()
+    existing = gitutil.in_worktree(here) and gitutil.toplevel(here).resolve() == here
+    if not a.to and not interactive() and not (existing and a.remote_name in iron_remotes(here)):
+        # Say so before `git init`, so a mistyped command leaves the folder untouched.
+        found = ", ".join(d.label for d in locations.detect_destinations()) or "none detected"
+        raise IronError("tell Iron where to keep the repository, e.g. `iron setup --to onedrive` or "
+                        "`iron setup --to D:/Backups`. Storage found on this computer: %s" % found)
     root, created = ensure_repo()
     if created:
         say("%s Started version control in %s" % (OK, root))
@@ -392,11 +508,7 @@ def cmd_setup(a):
     to = a.to
     prompting = interactive()
     if not to:
-        dests = locations.detect_destinations()
-        if not prompting:
-            found = ", ".join(d.label for d in dests) or "none detected"
-            raise IronError("tell Iron where to keep the repository, e.g. `iron setup --to onedrive` or "
-                            "`iron setup --to D:/Backups`. Storage found on this computer: %s" % found)
+        dests = locations.detect_destinations()  # not prompting was refused before `git init`
         say()
         say("Where should %r live?" % name)
         for i, d in enumerate(dests, 1):
@@ -430,7 +542,7 @@ def cmd_setup(a):
                 raise IronError("stopped so you can review those files. Edit .gitignore and run `iron setup` "
                                 "again, or pass --allow-secrets.")
         if confirm("Save your current files as the first version?", default=True, assume_yes=a.yes):
-            commit_all("First version", cwd=root)
+            commit_all("First version", cwd=root, allow_secrets=bool(risky))  # the user said yes to them above
             say("%s Saved the first version" % OK)
     add_remote(a.remote_name, container, encrypt=encrypt, cwd=root, no_claims=a.no_claims)
     if gitutil.head_sha(root):
@@ -470,8 +582,22 @@ def cmd_clone(a):
     return rc
 
 
+def waiting_message(holder):
+    say("Waiting for another Iron operation to finish (pid %s%s)..."
+        % (holder.get("pid", "?"), ": " + holder["what"] if holder.get("what") else ""))
+
+
 def cmd_sync(a):
     root = gitutil.toplevel()
+    with locks.repo_lock(root, "a sync", on_wait=waiting_message):
+        return _sync(root, a)
+
+
+def merge_title(remote):
+    return "Combine changes from %s" % remote
+
+
+def _sync(root, a):
     remote = a.remote or default_remote(root)
     branch = gitutil.current_branch(root)
     if not branch:
@@ -496,10 +622,10 @@ def cmd_sync(a):
             if gitutil.run_git(["diff", "--quiet", "HEAD"], cwd=root, check=False).returncode:
                 raise IronError("you have uncommitted changes. Save them first with `iron commit -am \"...\"`, "
                                 "then run `iron sync` again.")
-            cp = checkpoint.create("before syncing with %s" % remote, cwd=root)
+            cp = checkpoint.create("before syncing with %s" % remote, cwd=root, auto=True)
             say("Combining %d of your version(s) with %d from %s (checkpoint %s saved)..." % (ahead, behind, remote, cp.id))
-            rc = passthrough(["merge", "--no-edit", tracking], cwd=root, env=dict(gitutil.helper_env(),
-                                                                               **checkpoint.identity_env(root)))
+            rc = passthrough(["merge", "--no-edit", "-m", merge_title(remote), tracking], cwd=root,
+                             env=dict(gitutil.helper_env(), **checkpoint.identity_env(root)))
             if rc:
                 say()
                 say("%s Some files were changed on both sides. Edit the files marked above," % BAD)
@@ -533,8 +659,11 @@ def cmd_push(argv):
 
 def cmd_merge(argv):
     if gitutil.in_worktree() and gitutil.head_sha() and not any(x in ("--abort", "--continue", "--quit") for x in argv):
-        cp = checkpoint.create("before merge %s" % " ".join(argv))
-        say("checkpoint %s saved (undo with `iron restore %s`)" % (cp.id, cp.id))
+        root = gitutil.toplevel()
+        with locks.repo_lock(root, "a merge", on_wait=waiting_message):
+            cp = checkpoint.create("before merge %s" % " ".join(argv), cwd=root, auto=True)
+            say("checkpoint %s saved (undo with `iron restore %s`)" % (cp.id, cp.id))
+            return passthrough(["merge"] + argv)
     return passthrough(["merge"] + argv)
 
 
@@ -582,10 +711,17 @@ def cmd_agent(a):
     root = gitutil.toplevel()
     agent = a.name or os.environ.get("IRON_AGENT") or Path(a.command[0]).stem
     session = a.session or os.environ.get("IRON_SESSION") or uuid.uuid4().hex[:8]
+    # While the marker exists, autosave, the autosync hook and the dashboard's Sync wait, so the
+    # agent's half-done work is never published (and pulled back in after a rollback).
+    with locks.agent_marker(root, agent, session):
+        return _run_agent(a, root, agent, session)
+
+
+def _run_agent(a, root, agent, session):
     cp = checkpoint.create("before %s task" % agent, agent=agent, session=session, cwd=root)
     start_branch, start_head = gitutil.current_branch(root), gitutil.head_sha(root)
     say("iron: checkpoint %s saved before %s (session %s)" % (cp.id, agent, session))
-    env = {k: v for k, v in os.environ.items() if k != "IRON_KEY"}  # agents never see the key
+    env = {k: v for k, v in os.environ.items() if k not in ("IRON_KEY", locks.LOCK_ENV)}  # agents never see the key
     env.update(IRON_AGENT=agent, IRON_SESSION=session, IRON_CHECKPOINT=cp.id)
     command = [shutil.which(a.command[0]) or a.command[0]] + a.command[1:]
     code = subprocess.call(command, cwd=root, env=env)
@@ -597,19 +733,25 @@ def cmd_agent(a):
         if a.keep:
             say("%s the task failed; changes kept (undo with `iron restore %s`)" % (BAD, cp.id))
         else:
-            safety, _ = checkpoint.restore(cp.id, cwd=root, agent=agent, session=session)
-            if start_branch:
-                gitutil.git("symbolic-ref", "HEAD", "refs/heads/" + start_branch, cwd=root)
-            if start_head:
-                gitutil.git("reset", "--quiet", start_head, cwd=root)  # undo any commits the agent made
+            with locks.repo_lock(root, "rolling back %s" % agent, on_wait=waiting_message):
+                safety, _ = checkpoint.restore(cp.id, cwd=root, agent=agent, session=session)
+                if start_branch:
+                    gitutil.git("symbolic-ref", "HEAD", "refs/heads/" + start_branch, cwd=root)
+                if start_head:
+                    gitutil.git("reset", "--quiet", start_head, cwd=root)  # undo any commits the agent made
             say("%s the task failed, so the project was rolled back to checkpoint %s." % (BAD, cp.id))
             say("  The agent's attempt is kept as checkpoint %s if you want to look at it." % safety.id)
         return code or 1
     if a.no_commit or not has_changes(root):
         say("%s task finished%s" % (OK, "" if has_changes(root) else " (no changes)"))
         return 0
-    sha = commit_all(a.message or "%s: task %s" % (agent, session), cwd=root, agent=agent, session=session)
-    say("%s committed %s as %s" % (OK, sha[:10], agent))
+    result = commit_changes(a.message or "%s: task %s" % (agent, session), cwd=root, agent=agent, session=session)
+    if result["left_out"]:
+        say("%s %s" % (WARN, kept_out_line(result["left_out"])))
+    if not result["sha"]:
+        say("%s task finished (nothing to commit)" % OK)
+        return 0
+    say("%s committed %s as %s" % (OK, result["sha"][:10], agent))
     if a.push:
         return cmd_sync(argparse.Namespace(remote=None))
     return 0

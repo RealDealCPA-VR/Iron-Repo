@@ -7,7 +7,9 @@ background after every commit.
 
 Both are careful: they never force anything, never commit files that look
 like secrets, never run while git is in the middle of a merge, rebase or
-cherry-pick, and stop with a clear message when changes conflict.
+cherry-pick or while `iron agent` is working, take the repository lock so they
+never interleave with another Iron command, and stop with a clear message when
+changes conflict.
 """
 
 import hashlib
@@ -23,18 +25,25 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import checkpoint, gitutil, keys
-from .cli import BAD, OK, WARN, contains_private_key, iron_remotes, looks_secret, say
+from . import checkpoint, gitutil, keys, locks
+from .cli import (BAD, OK, UNMERGED, WARN, SecretsStaged, conflict_banner, iron_remotes, kept_out_line, say,
+                  secret_files, stage_changes, status_entries, unmerged_files)  # noqa: F401 - re-exported
 from .errors import IronError
 
 DOT_OFF = "o"
 PACKAGE_PARENT = str(Path(__file__).resolve().parent.parent)
 SAVED, CLEAN, SKIPPED, SYNCED, OFFLINE, CONFLICT = "saved", "clean", "skipped", "synced", "offline", "conflict"
-UNMERGED = {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}
+WAITING, RETRY, RACE = "waiting", "retry", "race"   # agent working; try again next tick; someone published too
+RACE_SIGNS = ("non-fast-forward", "fetch first", "[rejected]", "at the same moment", "changed while pushing",
+              "settling an interrupted push", "the remote is busy")
+EDITED_SIGNS = ("uncommitted changes", "Could not fast-forward", "would be overwritten", "Please commit your changes")
+BUSY_SIGNS = ("another Iron operation is running",)
+SYNC_RETRIES = 2        # immediate retries after someone else published at the same moment
 BUSY = [("MERGE_HEAD", "a merge is in progress"), ("rebase-merge", "a rebase is in progress"),
         ("rebase-apply", "a rebase is in progress"), ("CHERRY_PICK_HEAD", "a cherry-pick is in progress"),
         ("REVERT_HEAD", "a revert is in progress"), ("index.lock", "another git command is running")]
 HEARTBEAT = 20          # seconds between "still alive" updates while waiting
+HOOK_LOCK_WAIT = 1800   # the hook runs in the background, so it can wait for a long sync
 STALE = 90              # a heartbeat older than this means the process is gone
 LOG_BYTES, LOG_BACKUPS = 1048576, 3
 SKIP_ENV = "IRON_AUTOSYNC_SKIP"   # set while autosave commits, so the hook does not sync twice
@@ -145,60 +154,35 @@ def busy_reason(root):
     return None
 
 
-def status_entries(root):
-    """[(XY, path)] from `git status --porcelain`, one entry per file."""
-    out = gitutil.run_git(["status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=root).stdout
-    parts = out.decode("utf-8", errors="replace").split("\0")
-    entries, i = [], 0
-    while i < len(parts):
-        item = parts[i]
-        i += 1
-        if len(item) < 4:
-            continue
-        xy, path = item[:2], item[3:]
-        if "R" in xy or "C" in xy:
-            i += 1  # the original name of a rename or copy follows
-        entries.append((xy, path))
-    return entries
-
-
 def in_conflict(root):
-    return git_paths(root, ["MERGE_HEAD"])[0].exists() or any(xy in UNMERGED for xy, _ in status_entries(root))
+    """True when git holds files that both sides changed: a real conflict, not just a merge that is running."""
+    return bool(unmerged_files(root))
 
 
-def secret_files(root, paths):
-    out = []
-    for p in paths:
-        full = Path(root) / p
-        if full.is_file() and (looks_secret(p) or contains_private_key(full)):
-            out.append(p)
-    return out
-
-
-def _names(output):
-    return [p for p in output.decode("utf-8", errors="replace").split("\0") if p]
+def agent_trailers(root):
+    """Attribution for a commit made while `iron agent` works here (autosave waits then; this is a backstop)."""
+    info = locks.agent_session(root)
+    return checkpoint.trailers(info.get("agent"), info.get("session")) if info else checkpoint.trailers()
 
 
 def save(root, entries, log):
     """Commit every change except files that look like secrets. Returns (sha or None, result)."""
-    staged = _names(gitutil.run_git(["diff", "--cached", "--name-only", "-z", "--diff-filter=d"], cwd=root).stdout)
-    risky_staged = secret_files(root, staged)
-    if risky_staged:
+    try:
+        risky = stage_changes(root, entries)
+    except SecretsStaged as e:
         log.info("%s Not saving: %s %s staged and look%s like a secret. Unstage with `git restore --staged %s`."
-                 % (WARN, ", ".join(risky_staged[:5]), "is" if len(risky_staged) == 1 else "are",
-                    "s" if len(risky_staged) == 1 else "", risky_staged[0]), loud=True)
+                 % (WARN, ", ".join(e.paths[:5]), "is" if len(e.paths) == 1 else "are",
+                    "s" if len(e.paths) == 1 else "", e.paths[0]), loud=True)
         return None, SKIPPED
-    risky = secret_files(root, [p for _, p in entries])
     if risky != log.last_secrets and risky:
         log.info("%s Left out %d file(s) that look like secrets: %s. Add them to .gitignore to keep them out for good."
                  % (WARN, len(risky), ", ".join(risky[:6]) + (" ..." if len(risky) > 6 else "")), loud=True)
     log.last_secrets = risky
-    spec = "\0".join(["."] + [":(exclude,literal)%s" % p for p in risky]) + "\0"
-    gitutil.run_git(["add", "--all", "--pathspec-from-file=-", "--pathspec-file-nul"], cwd=root, input=spec)
-    changed = _names(gitutil.run_git(["diff", "--cached", "--name-only", "-z"], cwd=root).stdout)
+    changed = [p for p in gitutil.run_git(["diff", "--cached", "--name-only", "-z"], cwd=root).stdout
+               .decode("utf-8", errors="replace").split("\0") if p]
     if not changed:
         return None, CLEAN
-    lines = ["Iron-Autosave: true"] + checkpoint.trailers()
+    lines = ["Iron-Autosave: true"] + agent_trailers(root)
     text = "Autosave: %d file(s) changed\n\n%s\n" % (len(changed), "\n".join(lines))
     env = dict(checkpoint.identity_env(root), **{SKIP_ENV: "1"})
     proc = gitutil.run_git(["commit", "--quiet", "-F", "-"], cwd=root, input=text, env=env, check=False)
@@ -218,35 +202,97 @@ CONFLICT_HELP = ("%s Autosave stopped: your changes and the ones from the other 
                  "  and start autosave again. To back out instead: git merge --abort" % BAD)
 
 
-def sync_once(root, log, timeout=None):
-    """Run `iron sync` in a child process, so its output lands in the log. Returns SYNCED, OFFLINE or CONFLICT."""
-    timeout = timeout or float(os.environ.get("IRON_AUTOSAVE_SYNC_TIMEOUT", "1800"))
-    env = dict(gitutil.helper_env(), **{SKIP_ENV: "1"})
-    try:
-        proc = subprocess.run(gitutil.iron_command() + ["sync"], cwd=str(root), env=env,
-                              stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        log.info("%s Sync took longer than %d s and was stopped. Will try again next time." % (WARN, timeout), loud=True)
-        return OFFLINE
-    text = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
-    lines = [l.rstrip() for l in text.splitlines() if l.strip()]
-    for line in lines:
-        log.logger.info("  sync: %s", line)
-    if proc.returncode == 0:
-        published = [l for l in lines if "Published" in l or "Pulled" in l]
-        for line in published:
-            log.info(line)
+def conflict_help(root):
+    files = unmerged_files(root)
+    return (conflict_banner(files) + "\n" if files else "") + CONFLICT_HELP
+
+
+def classify_sync(root, returncode, text):
+    """What `iron sync` meant, judged by its output rather than its exit code alone:
+    SYNCED, CONFLICT, RETRY (files edited meanwhile, or another Iron operation), RACE or OFFLINE."""
+    if returncode == 0:
         return SYNCED
     if in_conflict(root):
-        log.info(CONFLICT_HELP, loud=True)
         return CONFLICT
-    log.info("%s Could not sync right now (offline, or the storage is not reachable). Will try again next time.%s"
-             % (WARN, ("\n  " + lines[-1]) if lines else ""), loud=True)
+    if any(sign in text for sign in BUSY_SIGNS + EDITED_SIGNS):
+        return RETRY
+    if any(sign in text for sign in RACE_SIGNS):
+        return RACE
     return OFFLINE
+
+
+def _run_sync(root, timeout):
+    env = dict(gitutil.helper_env(), **{SKIP_ENV: "1"})  # also lends the child our repository lock
+    proc = subprocess.run(gitutil.iron_command() + ["sync"], cwd=str(root), env=env,
+                          stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
+    return proc.returncode, (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+
+
+def sync_once(root, log, timeout=None):
+    """Run `iron sync` in a child process, so its output lands in the log.
+
+    Returns SYNCED, RETRY (try again next tick), OFFLINE or CONFLICT."""
+    timeout = timeout or float(os.environ.get("IRON_AUTOSAVE_SYNC_TIMEOUT", "1800"))
+    for attempt in range(SYNC_RETRIES + 1):
+        try:
+            code, text = _run_sync(root, timeout)
+        except subprocess.TimeoutExpired:
+            log.info("%s Sync took longer than %d s and was stopped. Will try again next time." % (WARN, timeout),
+                     loud=True)
+            return OFFLINE
+        lines = [l.rstrip() for l in text.splitlines() if l.strip()]
+        for line in lines:
+            log.logger.info("  sync: %s", line)
+        outcome = classify_sync(root, code, text)
+        last = ("\n  " + lines[-1]) if lines else ""
+        if outcome == SYNCED:
+            for line in lines:
+                if "Published" in line or "Pulled" in line:
+                    log.info(line)
+            return SYNCED
+        if outcome == CONFLICT:
+            log.info(conflict_help(root), loud=True)
+            return CONFLICT
+        if outcome == RETRY:
+            if any(sign in text for sign in BUSY_SIGNS):
+                log.info("Another Iron operation is running; will sync next time.%s" % last)
+            else:
+                log.info("Files changed while syncing; will try again next time.%s" % last)
+            return RETRY
+        if outcome == RACE:
+            if attempt < SYNC_RETRIES:
+                log.info("Someone else published at the same moment; retrying.")
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            log.info("%s Someone else kept publishing at the same moment; will try again next time.%s"
+                     % (WARN, last), loud=True)
+            return RETRY
+        log.info("%s Could not sync right now (offline, or the storage is not reachable). Will try again next time.%s"
+                 % (WARN, last), loud=True)
+        return OFFLINE
+    return RETRY
 
 
 def tick(root, log, sync=True):
     """Save a version if anything changed, then sync. Returns the most important outcome."""
+    agent = locks.agent_session(root)
+    if agent:
+        log.info("Waiting: an agent is working; waiting (%s). Nothing is saved or synced until it finishes."
+                 % locks.describe_agent(agent))
+        return WAITING
+    try:
+        with locks.repo_lock(root, "autosave", timeout=0):
+            return _tick(root, log, sync)
+    except locks.RepoBusy as e:
+        log.info("Skipped: another Iron operation is running (pid %s). Will try again next time."
+                 % e.holder.get("pid", "?"))
+        return SKIPPED
+
+
+def _tick(root, log, sync):
+    if in_conflict(root):
+        log.info(conflict_help(root), loud=True)  # loud every time, until someone fixes it
+        return CONFLICT
     reason = busy_reason(root)
     if reason:
         log.info("Skipped: %s. Will try again next time." % reason)
@@ -256,7 +302,7 @@ def tick(root, log, sync=True):
         return SKIPPED
     entries = status_entries(root)
     if any(xy in UNMERGED for xy, _ in entries):
-        log.info(CONFLICT_HELP, loud=True)
+        log.info(conflict_help(root), loud=True)
         return CONFLICT
     result = CLEAN
     if entries:
@@ -265,7 +311,7 @@ def tick(root, log, sync=True):
         log.info("Nothing changed.")
     if sync:
         synced = sync_once(root, log)
-        if synced in (CONFLICT, OFFLINE):
+        if synced != SYNCED:
             return synced
     return result
 
@@ -301,9 +347,11 @@ def write_state(root, **fields):
 
 
 def running(root):
-    """The state of a live autosave process for this repository, or None."""
+    """The state of a live autosave process for this repository, or None.
+
+    A process that has exited is noticed at once; one that hangs, after STALE seconds without a heartbeat."""
     state = read_state(root)
-    if state.get("pid") and time.time() - state.get("heartbeat", 0) < STALE:
+    if state.get("pid") and time.time() - state.get("heartbeat", 0) < STALE and locks.pid_alive(state["pid"]):
         return state
     return None
 
@@ -406,17 +454,36 @@ def systemd_available():
         return False
 
 
+def runner_path_dirs():
+    """The folders the background runner needs on PATH: git's, Iron's launchers' and Python's.
+
+    Only these go in front of the login session's own PATH, so later PATH changes still reach autosave."""
+    exe_dir = Path(sys.executable).resolve().parent
+    git = shutil.which("git")
+    candidates = ([Path(git).resolve().parent] if git else []) + gitutil.helper_dirs() + [exe_dir]
+    if os.name == "nt" and (exe_dir / "Scripts").is_dir():
+        candidates.append(exe_dir / "Scripts")
+    dirs = []
+    for d in map(str, candidates):
+        if d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
 def runner_script(root, every):
     home = str(keys.iron_home())
     return ("# Iron autosave for %s\n"
             "# Written by `iron autosave --install`; `iron autosave --uninstall` removes it.\n"
             "import os\nimport sys\n\n"
             "sys.path.insert(0, %r)\n"
-            "os.environ[\"PATH\"] = %r\n"
+            "# git, Iron's launchers and Python, in front of the login session's own PATH\n"
+            "NEEDED = %r\n"
+            "os.environ[\"PATH\"] = os.pathsep.join(NEEDED + [p for p in os.environ.get(\"PATH\", \"\").split(os.pathsep)\n"
+            "                                           if p and p not in NEEDED])\n"
             "os.environ.setdefault(\"IRON_HOME\", %r)\n"
             "from iron.autosave import run_background\n\n"
             "sys.exit(run_background(%r, %r))\n"
-            % (root, PACKAGE_PARENT, os.environ.get("PATH", ""), home, str(root), every))
+            % (root, PACKAGE_PARENT, runner_path_dirs(), home, str(root), every))
 
 
 def _label(root):
@@ -634,6 +701,12 @@ def show_status(root):
                                   if last.get("last_result") else ""))
     say("%s Sync after every commit: %s" % (OK if hook_installed(root) else DOT_OFF,
                                             "on" if hook_installed(root) else "off (turn on with `iron autosync on`)"))
+    agent = locks.agent_session(root)
+    if agent:
+        say("%s %s is working here; autosave waits until it finishes." % (WARN, locks.describe_agent(agent)))
+    conflicts = unmerged_files(root)
+    if conflicts:
+        say(conflict_banner(conflicts))
     say("  Log: %s" % log_path(root))
     return 0
 
@@ -791,12 +864,18 @@ def hook_main():
     try:
         if os.environ.get(SKIP_ENV):
             return
+        os.environ.pop(locks.LOCK_ENV, None)  # the commit that started us may hold the lock; it is not ours
         hide_child_consoles()
         root = gitutil.toplevel()
         if not iron_remotes(root):
             return
         log = Log(log_path(root, "autosync"), console=False)
         try:
+            agent = locks.agent_session(root)
+            if agent:
+                log.info("Not syncing: an agent is working; waiting (%s). Autosave or `iron sync` publishes "
+                         "its work once it is done." % locks.describe_agent(agent))
+                return
             for _ in range(20):  # git may still be finishing the commit
                 reason = busy_reason(root)
                 if not reason:
@@ -826,7 +905,16 @@ def hook_main():
                     except OSError:
                         pass
                     log.info("Syncing after commit %s" % (gitutil.head_sha(root) or "")[:10])
-                    if sync_once(root, log) == CONFLICT or not pending.exists():
+                    if locks.agent_session(root):
+                        log.info("Not syncing: an agent is working; waiting.")
+                        break
+                    try:
+                        with locks.repo_lock(root, "autosync", timeout=HOOK_LOCK_WAIT):
+                            outcome = sync_once(root, log)
+                    except locks.RepoBusy as e:
+                        log.info("Not syncing: %s" % e)
+                        break
+                    if outcome == CONFLICT or not pending.exists():
                         break
             finally:
                 lock.unlink()

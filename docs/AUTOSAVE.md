@@ -22,9 +22,15 @@ iron autosave --once          # one save-and-sync, then exit (scripts, CI, tests
 
 Each tick:
 
-1. **Checks that git is idle.** If a merge, rebase, cherry-pick or revert is
-   in progress, or another git command holds `index.lock`, the tick is skipped
-   and retried next time. A detached HEAD is skipped too.
+1. **Checks that nobody else is at work.** While `iron agent` runs here, the
+   tick only logs "an agent is working; waiting": the agent's half-done work
+   is never saved or published, so a rollback stays rolled back. The tick then
+   takes the repository lock (`.git/iron/repo.lock`, shared by `iron sync`,
+   `iron commit`-style saves, checkpoints and restores); if another Iron
+   operation holds it, the tick is skipped and names its process. If a merge,
+   rebase, cherry-pick or revert is in progress, or another git command holds
+   `index.lock`, the tick is skipped and retried next time. A detached HEAD is
+   skipped too.
 2. **Looks for changes** with `git status --porcelain` (cheap; nothing is
    staged unless something changed).
 3. **Saves a version** of every change, new files included, with the message
@@ -35,10 +41,27 @@ Each tick:
    publish. This also runs when nothing changed, so versions saved while you
    were offline, and other computers' work, still flow.
 
-**Offline or storage unreachable:** the version is still saved locally; the
-sync is retried next tick. **Conflicts** (both sides changed the same lines):
-autosave stops with instructions. Fix the files, `iron commit -am "Combine
+When a sync fails, autosave reads what it said:
+
+| What happened | What autosave does |
+|---|---|
+| Someone else published at the same moment (rejected, non-fast-forward) | retries at once, twice, then next tick |
+| You edited files while it synced ("uncommitted changes") | tries again next tick |
+| Another Iron operation was running | tries again next tick |
+| Both sides changed the same lines | stops (see below) |
+| Storage or connection error | "offline": the version is saved locally; the sync is retried next tick |
+
+**Conflicts** (git holds files that both sides changed): autosave stops, and
+says so loudly on every later tick until they are fixed: "Files conflict
+between your computers: <files>". `iron`, `iron autosave --status` and the
+dashboard show the same banner. Fix the files, `iron commit -am "Combine
 changes"`, `iron sync`, and start it again. To back out: `git merge --abort`.
+A merge that is merely in progress, with no conflicted files, is skipped
+quietly instead.
+
+Merges made by a sync are titled "Combine changes from <remote>". The
+checkpoints Iron takes before syncing or merging are pruned to the newest 20;
+your own, agent and restore-safety checkpoints are kept.
 
 ### Safety
 
@@ -47,11 +70,20 @@ changes"`, `iron sync`, and start it again. To back out: `git merge --abort`.
   `PRIVATE KEY-----`) are left out of every autosave, with a warning telling
   you to add them to `.gitignore`. The rest of your work is still saved. If
   such a file is already staged by hand, autosave refuses to save at all until
-  you unstage it (`git restore --staged <file>`).
+  you unstage it (`git restore --staged <file>`). The same rule applies to
+  every version Iron saves: the dashboard's "Save version", `iron agent` and
+  the Python API. `iron` lists them as "N file(s) kept out because they look
+  like secrets" instead of counting them as pending changes.
 - **Nothing is forced.** Autosave uses the normal sync: fast-forward or merge,
   never force-push, never delete.
 - One autosave per repository: a second one refuses to start while the first
-  is alive.
+  is alive. If the first one's process has exited, the new one starts at once.
+- **No interleaving.** Every Iron command that changes the repository holds
+  `.git/iron/repo.lock` (pid and start time inside; a lock whose process is
+  gone is taken over). Commands wait for it with "Waiting for another Iron
+  operation to finish (pid N)"; `IRON_REPO_LOCK_TIMEOUT` (seconds, default
+  300) sets how long before they give up with "another Iron operation is
+  running (pid N)". Autosave never waits; it tries again next tick.
 
 ## Running at login: `--install`
 
@@ -71,7 +103,9 @@ Per user, no admin rights:
 
 Each registration starts a small runner script,
 `<IRON_HOME>/autosave/<repo>-runner.py`, which remembers the repository, the
-interval, your `PATH` (so git is found) and where Iron is installed.
+interval and where Iron is installed. It puts only the folders it needs (git's,
+Iron's launchers' and Python's) in front of the login session's own `PATH`, so
+later changes to your `PATH` still reach it.
 `<repo>` is the folder name plus a short hash of its path, so two projects
 with the same name do not clash.
 
@@ -107,7 +141,8 @@ commits are queued and published by the same sync.
   from Iron's hook. `iron autosync off` removes only Iron's block, or puts the
   original hook back, byte for byte.
 - Commits made by `iron autosave` do not trigger the hook (autosave syncs
-  itself), and the hook does nothing during a merge, rebase or cherry-pick.
+  itself), and the hook does nothing during a merge, rebase or cherry-pick,
+  or while `iron agent` is working. It takes the repository lock for its sync.
 
 You can use both: autosave for unsaved edits, autosync for the commits you
 make yourself.

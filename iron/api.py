@@ -18,8 +18,8 @@ import os
 import subprocess
 from pathlib import Path
 
-from . import checkpoint, gitutil, locations, maintenance
-from .cli import commit_all, default_remote, iron_remotes, open_remote
+from . import checkpoint, gitutil, locations, locks, maintenance
+from .cli import commit_changes, default_remote, iron_remotes, kept_out, open_remote, unmerged_files
 from .errors import IronError, KeyMissing
 from .remote import RemoteRepo
 
@@ -55,8 +55,14 @@ class Repository:
         for line in self._git("status", "--porcelain").splitlines():
             if line.strip():
                 changes.append({"status": line[:2].strip(), "path": line[3:]})
+        agent = locks.agent_session(self.path)
         return {"branch": branch, "head": gitutil.head_sha(self.path), "changes": changes,
-                "remotes": iron_remotes(self.path), "clean": not changes}
+                "remotes": iron_remotes(self.path), "clean": not changes,
+                # files both computers changed: fix them, commit, sync
+                "conflicts": unmerged_files(self.path),
+                # files saving leaves out because they look like secrets (add them to .gitignore)
+                "kept_out": kept_out(self.path),
+                "agent_working": agent}
 
     def checkpoint(self, message=""):
         return checkpoint.create(message, agent=self.agent, session=self.session, cwd=self.path).as_dict()
@@ -87,8 +93,16 @@ class Repository:
         return self._git("diff", "--no-color", "--no-ext-diff", base, tree, "--", *paths)
 
     def commit(self, message):
-        """Commit every change with agent attribution. Returns the new sha, or None if nothing changed."""
-        return commit_all(message, cwd=self.path, agent=self.agent, session=self.session)
+        """Commit every change with agent attribution. Returns the new sha, or None if nothing changed.
+
+        Files that look like secrets are left out; ``commit_details`` says which."""
+        return self.commit_details(message)["sha"]
+
+    def commit_details(self, message):
+        """Like ``commit``, but returns {"sha": sha or None, "left_out": [paths kept out as secrets]}.
+
+        Raises IronError if a file that looks like a secret was staged by hand."""
+        return commit_changes(message, cwd=self.path, agent=self.agent, session=self.session)
 
     def restore(self, target):
         safety, sha = checkpoint.restore(target, cwd=self.path, agent=self.agent, session=self.session)
@@ -159,10 +173,18 @@ class Repository:
         return sorted(sessions.values(), key=lambda s: s["last_date"], reverse=True)
 
     def sync(self, remote=None):
-        """Run ``iron sync`` in a child process (it reports as it goes); returns its outcome and output."""
+        """Run ``iron sync`` in a child process (it reports as it goes); returns its outcome and output.
+
+        While ``iron agent`` is working here it does not sync: {"ok": False, "waiting": True, ...}."""
+        agent = locks.agent_session(self.path)
+        if agent:
+            return {"ok": False, "waiting": True,
+                    "output": "%s is working; waiting. Sync again when it finishes." % locks.describe_agent(agent)}
         here = str(Path(__file__).resolve().parent.parent)
         env = dict(gitutil.helper_env(), PYTHONIOENCODING="utf-8", GIT_TERMINAL_PROMPT="0",
                    PYTHONPATH=os.pathsep.join(p for p in (here, os.environ.get("PYTHONPATH")) if p))
+        if not locks.holds_lock(self.path):
+            env.pop(locks.LOCK_ENV, None)  # another thread's lock is not ours to lend
         proc = subprocess.run(gitutil.iron_command() + ["sync"] + ([remote] if remote else []), cwd=self.path,
                               env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
                               stdin=subprocess.DEVNULL)

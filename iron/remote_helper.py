@@ -162,6 +162,16 @@ class Helper:
             src, _, dst = spec[1:].partition(":") if force else spec.partition(":")
             parsed.append((force, src, dst))
         results = {}
+        # Resolve every source once, before talking to the remote or uploading anything, and use
+        # those shas from here on: a branch that moves during a slow upload must not make us report
+        # "ok" for a commit we never sent. Git gives a push-capable helper only the ref names
+        # (`push <src>:<dst>`), never the sha it expects to be pushed, so this is as early as the
+        # value can be pinned; Iron's repository lock keeps the branch still during `iron sync`.
+        resolved = {}
+        for _, src, _ in parsed:
+            if src and src not in resolved:
+                proc = gitutil.run_git(["rev-parse", "--verify", "--quiet", src], check=False)
+                resolved[src] = proc.stdout.decode().strip() if proc.returncode == 0 else ""
 
         marker = self.repo.open(required=False)
         if marker is None and gitutil.env_flag("IRON_CREATE") and not self.dry_run:
@@ -198,9 +208,8 @@ class Helper:
                 else:
                     updates.append({"ref": dst, "old": old, "new": None})
                 continue
-            proc = gitutil.run_git(["rev-parse", "--verify", "--quiet", src], check=False)
-            new = proc.stdout.decode().strip()
-            if proc.returncode != 0 or not new:
+            new = resolved.get(src)
+            if not new:
                 results[dst] = "src refspec %s does not match any object" % src
                 continue
             if old == new:
