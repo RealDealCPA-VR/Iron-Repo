@@ -93,7 +93,8 @@ def current_branch(cwd=None):
 def helper_dirs():
     """Directories that hold a git-remote-iron launcher, so git can find the helper."""
     names = ("git-remote-iron", "git-remote-iron.exe")
-    candidates = [Path(sys.argv[0]).resolve().parent if sys.argv and sys.argv[0] else None,
+    candidates = [Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else None,  # standalone build
+                  Path(sys.argv[0]).resolve().parent if sys.argv and sys.argv[0] else None,
                   Path(__file__).resolve().parent.parent / "bin",
                   Path(sysconfig.get_path("scripts"))]
     try:
