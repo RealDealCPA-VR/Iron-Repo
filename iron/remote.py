@@ -317,7 +317,9 @@ class RemoteRepo:
                     or os.environ.get("USER", "?"), "pid": os.getpid(), "created": now_iso(), "ttl": LOCK_TTL}
             self.store.write("locks/" + token, json.dumps(body).encode())
             live = self.live_locks()
-            if not live or live[0] == token:
+            # The oldest lock wins. A tie in the same millisecond is "busy" for this caller: the
+            # other one may already have listed, seen only itself and taken the lock.
+            if not live or (live[0] == token and not any(n[:13] == token[:13] for n in live[1:])):
                 break
             self.store.delete("locks/" + token)
             if time.monotonic() > deadline:
