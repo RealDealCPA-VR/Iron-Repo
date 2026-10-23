@@ -16,10 +16,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import gitutil
+from . import gitutil, locks
 from .errors import IronError
 
 NAMESPACE = "refs/iron/checkpoints/"
+# Checkpoints Iron takes on its own before syncing or merging. Only these are pruned;
+# manual, agent and restore-safety checkpoints are kept for ever.
+AUTO_PREFIXES = ("before syncing with ", "before merge ")
+KEEP_AUTO = 20
 
 
 @dataclass
@@ -83,8 +87,17 @@ def trailers(agent=None, session=None):
     return lines
 
 
-def create(message="", agent=None, session=None, cwd=None):
+def create(message="", agent=None, session=None, cwd=None, auto=False):
+    """Snapshot the working tree. ``auto`` marks Iron's own checkpoints, of which the newest 20 are kept."""
     root = gitutil.toplevel(cwd)
+    with locks.repo_lock(root, "a checkpoint"):
+        cp = _create(root, message, agent, session)
+        if auto:
+            prune_auto(root)
+        return cp
+
+
+def _create(root, message, agent, session):
     tree = snapshot_tree(root)
     head = gitutil.head_sha(root)
     latest = (list_checkpoints(root) or [None])[0]
@@ -99,7 +112,18 @@ def create(message="", agent=None, session=None, cwd=None):
     args = ["commit-tree", tree, "-F", "-"] + (["-p", head] if head else [])
     sha = gitutil.git(*args, cwd=root, input=text, env=identity_env(root))
     gitutil.git("update-ref", "-m", "iron checkpoint", NAMESPACE + cid, sha, cwd=root)
-    return Checkpoint(cid, sha, now.isoformat(timespec="seconds"), message or "checkpoint")
+    date = gitutil.git("log", "-1", "--format=%cI", sha, cwd=root)  # the same format list_checkpoints shows
+    return Checkpoint(cid, sha, date, message or "checkpoint")
+
+
+def prune_auto(root, keep=KEEP_AUTO):
+    """Delete all but the newest ``keep`` automatic checkpoints. Returns how many were deleted."""
+    auto = [c for c in list_checkpoints(root) if c.message.startswith(AUTO_PREFIXES)]
+    old = auto[keep:]
+    if old:
+        script = "".join("delete %s%s\n" % (NAMESPACE, c.id) for c in old)
+        gitutil.git("update-ref", "--stdin", cwd=root, input=script)
+    return len(old)
 
 
 def list_checkpoints(cwd=None):
@@ -142,6 +166,11 @@ def restore(target, cwd=None, agent=None, session=None):
     not move; afterwards ``git status`` shows the restored content as changes.
     """
     root = gitutil.toplevel(cwd)
+    with locks.repo_lock(root, "a restore"):
+        return _restore(root, target, agent, session)
+
+
+def _restore(root, target, agent, session):
     sha = resolve(target, root)
     safety = create("before restore to %s" % target, agent=agent, session=session, cwd=root)
     wanted = _files(sha, root)

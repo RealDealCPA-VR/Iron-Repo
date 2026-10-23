@@ -64,6 +64,14 @@ def test_once_skips_while_a_merge_or_another_git_command_is_running(home):
     commit(repo, "README.md", "ours\n")
     assert git(repo, "merge", "other", check=False).returncode != 0  # conflict: merge in progress
     before = head(repo)
+    out = iron(repo, "autosave", "--once", check=False)  # conflicted files stop autosave, loudly
+    assert out.returncode == 1 and "Files conflict between your computers: README.md" in out.stdout
+    assert head(repo) == before
+    git(repo, "merge", "--abort")
+    git(repo, "switch", "-q", "-c", "clean-side")
+    commit(repo, "side.txt", "s\n")
+    git(repo, "switch", "-q", "main")
+    git(repo, "merge", "--no-commit", "--no-ff", "clean-side")  # a merge in progress, nothing conflicted
     out = iron(repo, "autosave", "--once")
     assert "a merge is in progress" in out.stdout and head(repo) == before
     git(repo, "merge", "--abort")
@@ -132,8 +140,8 @@ def test_stops_on_conflicts_with_a_clear_message(home):
     assert out.returncode == 1 and "Autosave stopped" in out.stdout and "iron commit" in out.stdout
     assert git(b, "log", "-1", "--format=%s", "HEAD").stdout.startswith("Autosave:")  # b's work is saved
     assert published(a, home / "remote.iron") == head(a)  # nothing was forced over a's version
-    out = iron(b, "autosave", "--once")
-    assert "a merge is in progress" in out.stdout
+    out = iron(b, "autosave", "--once", check=False)  # and it keeps saying so
+    assert out.returncode == 1 and "Files conflict between your computers: README.md" in out.stdout
 
 
 def wait_for(condition, timeout=60):
@@ -265,9 +273,10 @@ def test_status_reports_a_running_autosave(home):
 
     repo = synced_repo(home)
     os.chdir(str(repo))
-    autosave.write_state(repo, pid=12345, heartbeat=time.time(), every=300, last_result="saved", last_tick="now")
+    pid = os.getpid()  # a live process that is not the one we start below
+    autosave.write_state(repo, pid=pid, heartbeat=time.time(), every=300, last_result="saved", last_tick="now")
     out = iron(repo, "autosave", "--status", env=dict(os.environ, IRON_AUTOSAVE_PLATFORM="windows")).stdout
-    assert "Running: yes (process 12345" in out
+    assert "Running: yes (process %d" % pid in out
     out = iron(repo, "autosave", "--once", check=False)
     assert out.returncode == 1 and "already running" in out.stderr
     autosave.write_state(repo, heartbeat=time.time() - 3600)
