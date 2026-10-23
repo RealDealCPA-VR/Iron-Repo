@@ -44,6 +44,8 @@ Everyday
   iron commit -am "msg"      save a version (any git command works: log, diff, branch, ...)
   iron history               recent versions, with which agent made them
   iron ui [--port N] [--no-browser]   the same in your browser: changes, history, restore, storage
+  iron autosave [--every 5m] save and sync automatically (--install: in the background at login)
+  iron autosync on|off       publish every commit in the background
 
 Safety net
   iron checkpoint [-m msg]   snapshot everything right now, without committing
@@ -863,6 +865,9 @@ def build_parsers():
 
     p = parser("doctor", cmd_doctor)
     p.add_argument("--deep", action="store_true", help="run the provider compliance suite on each remote")
+
+    from . import autosave  # imported here: it uses this module's helpers
+    autosave.register(parser)
     return parsers
 
 
