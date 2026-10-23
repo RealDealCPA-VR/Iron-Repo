@@ -14,12 +14,22 @@ import tempfile
 from .base import NotFound, StorageError, StorageProvider, TransientError
 
 
+def installed_rclone():
+    """Where `iron connect` puts the rclone it downloads: <IRON_HOME>/bin/rclone[.exe]."""
+    home = os.environ.get("IRON_HOME") or os.path.join(os.path.expanduser("~"), ".iron")
+    return os.path.join(home, "bin", "rclone.exe" if os.name == "nt" else "rclone")
+
+
 def rclone_command():
-    """The rclone executable as an argv prefix. IRON_RCLONE overrides it (a path, or a JSON list)."""
+    """The rclone executable as an argv prefix: IRON_RCLONE (a path, or a JSON list) if set,
+    then the copy `iron connect` installed in <IRON_HOME>/bin, then rclone on PATH."""
     raw = os.environ.get("IRON_RCLONE", "").strip()
     if raw.startswith("["):
         return json.loads(raw)
-    return [raw or "rclone"]
+    if raw:
+        return [raw]
+    own = installed_rclone()
+    return [own] if os.path.isfile(own) else ["rclone"]
 
 
 def rclone_available():
