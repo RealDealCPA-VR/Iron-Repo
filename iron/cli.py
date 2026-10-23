@@ -32,6 +32,7 @@ USAGE = """iron {version} - your code, your history, your storage.
 Get started
   iron setup                 put this folder under version control and back it up to storage you own
   iron clone <location>      get a repository onto this computer
+  iron connect <provider>    sign in to google-drive, onedrive, dropbox, box, pcloud, s3, b2, webdav directly
   iron doctor                check that everything is installed and reachable
 
 Everyday
@@ -772,6 +773,9 @@ def build_parsers():
     p.add_argument("--yes", "-y", action="store_true", help="accept defaults without asking")
     p.add_argument("--allow-secrets", action="store_true", help="save files that look like secrets anyway")
     p.add_argument("--no-claims", action="store_true", help="the folder is synced by a client Iron may not detect")
+
+    from .connect import add_arguments, cmd_connect
+    add_arguments(parser("connect", cmd_connect, description="Connect cloud storage directly through rclone."))
 
     p = parser("init", cmd_init)
     p.add_argument("directory", nargs="?")
