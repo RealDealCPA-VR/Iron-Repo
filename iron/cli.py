@@ -24,6 +24,7 @@ from .remote import RemoteRepo
 from .remote_helper import cache_dir_for
 from .storage import rclone_available
 from .storage.compliance import run_compliance
+from .update import cmd_update, install_hint, reinstall_hint
 
 OK, WARN, BAD, DOT = "\u2713", "!", "\u2717", "\u25cf"
 
@@ -34,6 +35,7 @@ Get started
   iron clone <location>      get a repository onto this computer
   iron connect <provider>    sign in to google-drive, onedrive, dropbox, box, pcloud, s3, b2, webdav directly
   iron doctor                check that everything is installed and reachable
+  iron update                update Iron itself to the latest version
 
 Everyday
   iron                       overview of this repository
@@ -724,9 +726,10 @@ def cmd_doctor(a):
     line(sys.version_info >= (3, 8), "Python %s" % sys.version.split()[0])
     try:
         v = gitutil.git_version()
-        line(v >= gitutil.MIN_GIT, "git %s (needs %d.%d or newer)" % (".".join(map(str, v)), *gitutil.MIN_GIT))
+        line(v >= gitutil.MIN_GIT, "git %s (needs %d.%d or newer)" % (".".join(map(str, v)), *gitutil.MIN_GIT)
+             + ("" if v >= gitutil.MIN_GIT else ". Update it: %s" % (install_hint("git") or "https://git-scm.com/downloads")))
     except (IronError, OSError):
-        line(False, "git is not installed: https://git-scm.com/downloads")
+        line(False, "git is not installed. Install it: %s" % (install_hint("git") or "https://git-scm.com/downloads"))
     helper = gitutil.helper_on_path()
     if helper:
         line(True, "git-remote-iron on PATH: %s" % helper)
@@ -734,11 +737,11 @@ def cmd_doctor(a):
         line(False, "git-remote-iron is in %s but not on PATH. `iron` works anyway; add that folder to "
              "PATH so plain `git` can use iron:: remotes too" % gitutil.helper_dirs()[0], optional=True)
     else:
-        line(False, "git-remote-iron not found: reinstall Iron (see README)")
+        line(False, "git-remote-iron not found. Reinstall Iron:  %s" % reinstall_hint())
     line(crypto_available(), "encryption support" + ("" if crypto_available() else
          " (optional: python -m pip install cryptography)"), optional=True)
     line(rclone_available(), "rclone" + ("" if rclone_available() else
-         " (optional, for direct cloud APIs: https://rclone.org/install/)"), optional=True)
+         " (optional, for direct cloud APIs: %s)" % (install_hint("rclone") or "https://rclone.org/install/")), optional=True)
     dests = locations.detect_destinations()
     say("Storage found on this computer: %s" % (", ".join("%s (%s)" % (d.label, d.location) for d in dests) or "none"))
     if gitutil.in_worktree():
@@ -845,6 +848,8 @@ def build_parsers():
     p = parser("unlock", cmd_unlock)
     p.add_argument("remote", nargs="?")
     p.add_argument("--yes", "-y", action="store_true")
+
+    parser("update", cmd_update, description="Update Iron itself: git pull, or a verified fresh download.")
 
     p = parser("doctor", cmd_doctor)
     p.add_argument("--deep", action="store_true", help="run the provider compliance suite on each remote")
