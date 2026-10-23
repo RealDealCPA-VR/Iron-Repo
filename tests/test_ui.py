@@ -12,6 +12,7 @@ import pytest
 
 from conftest import commit, git, iron, loc, make_repo, write
 from iron import ui
+from iron.errors import IronError
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -36,7 +37,7 @@ def dash(env):
 
 
 def call(d, path, body=None, token=True, headers=None):
-    """(status, decoded JSON or text, response headers)."""
+    """(status, decoded JSON or text, response headers). No reply ever sets a cookie."""
     h = {}
     if token:
         h["X-Iron-Token"] = d.token if token is True else token
@@ -50,6 +51,7 @@ def call(d, path, body=None, token=True, headers=None):
         code, raw, hdrs = resp.status, resp.read(), resp.headers
     except urllib.error.HTTPError as e:
         code, raw, hdrs = e.code, e.read(), e.headers
+    assert hdrs.get_all("Set-Cookie") is None, "the dashboard must never set a cookie"
     text = raw.decode("utf-8")
     try:
         return code, json.loads(text), hdrs
@@ -145,8 +147,13 @@ def test_sync_and_verify_run_in_the_background(dash, env):
     report = wait(dash, ok(dash, "/api/verify", {"remote": "origin", "deep": True}))
     assert report["result"]["ok"] and report["result"]["commits"] == 3
 
-    failed = wait(dash, ok(dash, "/api/verify", {"remote": "nowhere-at-all"}))
-    assert failed["state"] == "failed" and "Traceback" not in failed["error"]
+    # only this repository's own remotes, by name: never a path the page made up
+    for remote in ("nowhere-at-all", loc(env / "backup.iron"), str(env / "backup.iron"),
+                   "\\\\attacker.example\\share\\x.iron", "//attacker.example/share/x.iron", ["origin"]):
+        code, data, _ = call(dash, "/api/verify", {"remote": remote})
+        assert code == 400 and "Traceback" not in data["error"], (remote, data)
+    assert "not one of this repository's backups" in call(dash, "/api/verify", {"remote": "nowhere-at-all"})[1]["error"]
+    assert wait(dash, ok(dash, "/api/verify", {}))["state"] == "done"      # no name: the default remote
 
 
 def test_agent_sessions_come_from_trailers(dash, env):
@@ -160,23 +167,72 @@ def test_agent_sessions_come_from_trailers(dash, env):
     assert ok(dash, "/api/history?n=1")["history"][0]["agent"] == "Claude"
 
 
-def test_page_needs_the_token_and_trades_it_for_a_strict_cookie(dash):
-    code, text, _ = call(dash, "/", token=False)
-    assert code == 403 and "iron ui" in text
-    code, _, headers = call(dash, "/?token=wrong", token=False)
-    assert code == 403
-    code, _, headers = call(dash, "/?token=" + dash.token, token=False)
-    assert code == 303 and headers["Location"] == "/"
-    cookie = headers["Set-Cookie"]
-    assert "HttpOnly" in cookie and "SameSite=Strict" in cookie and dash.token in cookie
-    code, page, headers = call(dash, "/", token=False, headers={"Cookie": cookie.split(";")[0]})
+def test_page_keeps_the_token_in_memory_never_in_a_cookie(dash):
+    code, page, headers = call(dash, "/?token=" + dash.token, token=False)
     assert code == 200 and "Sync now" in page and "Save version" in page
+    assert dash.token not in page                          # the page itself carries no secret
     csp = headers["Content-Security-Policy"]
     assert "default-src 'none'" in csp and "frame-ancestors 'none'" in csp and "http" not in csp
+    assert headers["X-Frame-Options"] == "DENY"
     assert "<script src" not in page and "<link rel=\"stylesheet\"" not in page  # nothing from a CDN
-    # the cookie alone opens the read-only API too
-    code, data, _ = call(dash, "/api/status", token=False, headers={"Cookie": cookie.split(";")[0]})
-    assert code == 200 and data["name"] == "project"
+    # the script reads ?token=, drops it from the address bar, and sends it as a header
+    assert "history.replaceState" in page and "sessionStorage" in page and '"X-Iron-Token": TOKEN' in page
+    assert "document.cookie" not in page
+    # a reload (no token in the URL) gets the same empty shell; the script finds the token in sessionStorage
+    code, shell, _ = call(dash, "/", token=False)
+    assert code == 200 and dash.token not in shell and "open the link" in shell.lower()
+    # an old or wrong link says so
+    code, text, _ = call(dash, "/?token=wrong", token=False)
+    assert code == 403 and "iron ui" in text
+
+
+def test_every_other_path_needs_the_header(dash):
+    """Same host and port, no X-Iron-Token: refused, whatever the path and whatever cookie comes along."""
+    cookie = {"Cookie": "iron_ui_%d=%s; token=%s" % (dash.port, dash.token, dash.token)}
+    for path in ("/api/status", "/api/changes", "/api/history", "/api/diff", "/api/storage", "/api/agents",
+                 "/api/checkpoints", "/api/jobs/abc", "/api/nope", "/favicon.ico", "/index.html",
+                 "/api/status?token=" + dash.token):
+        assert call(dash, path, token=False)[0] == 403, path
+        assert call(dash, path, token=False, headers=cookie)[0] == 403, path
+    assert call(dash, "/api/status")[0] == 200
+
+
+def test_conflicts_kept_out_and_refusals_reach_the_page(dash, monkeypatch):
+    status = ok(dash, "/api/status")
+    assert status["conflicts"] == [] and status["kept_out"] == []
+    # a real merge conflict shows up even before Repository.status() reports "conflicts"
+    git(dash.project, "switch", "-qc", "other")
+    commit(dash.project, "README.md", "theirs\n", "their edit")
+    git(dash.project, "switch", "-q", "main")
+    commit(dash.project, "README.md", "ours\n", "our edit")
+    git(dash.project, "merge", "-q", "other", check=False)
+    assert ok(dash, "/api/status")["conflicts"] == ["README.md"]
+    git(dash.project, "merge", "--abort")
+
+    real = dash.repo.status
+    monkeypatch.setattr(dash.repo, "status", lambda: dict(real(), conflicts=["src/app.py", {"path": "b.txt"}],
+                                                          kept_out=[".env"]))
+    status = ok(dash, "/api/status")
+    assert status["conflicts"] == ["src/app.py", "b.txt"] and status["kept_out"] == [".env"]
+    page = call(dash, "/", token=False)[1]
+    assert "These files conflict between your computers" in page and "look like secrets" in page
+
+    def refuse(message):
+        raise IronError("these files conflict between your computers: src/app.py")
+    monkeypatch.setattr(dash.repo, "commit", refuse)
+    write(dash.project / "src" / "app.py", "print('v2')\n")
+    code, data, _ = call(dash, "/api/commit", {"message": "try"})
+    assert code == 400 and data["error"] == "these files conflict between your computers: src/app.py"
+    assert "The version was not saved: " in page                       # shown as it came from the API
+
+
+def test_history_marks_autosaved_versions(dash):
+    write(dash.project / "src" / "app.py", "print('auto')\n")
+    git(dash.project, "commit", "-qam", "Autosave 12:00\n\nIron-Autosave: true")
+    history = ok(dash, "/api/history")["history"]
+    assert [(h["subject"], h["autosave"]) for h in history] == [
+        ("Autosave 12:00", True), ("add src/app.py", False), ("add README.md", False)]
+    assert "autosaved" in call(dash, "/", token=False)[1]
 
 
 def test_requests_without_token_or_from_elsewhere_are_refused(dash):
@@ -192,8 +248,7 @@ def test_requests_without_token_or_from_elsewhere_are_refused(dash):
     # cross-site POSTs, a POST without the header token, and one without an Origin
     assert call(dash, "/api/commit", {"message": "evil"}, headers={"Origin": "http://evil.example"})[0] == 403
     assert call(dash, "/api/commit", {"message": "evil"}, headers={"Sec-Fetch-Site": "cross-site"})[0] == 403
-    cookie = "%s=%s" % ("iron_ui_%d" % dash.port, dash.token)
-    assert call(dash, "/api/commit", {"message": "evil"}, token=False, headers={"Cookie": cookie})[0] == 403
+    assert call(dash, "/api/commit", {"message": "evil"}, token=False)[0] == 403
     req = urllib.request.Request(dash.base + "/api/commit", data=b'{"message": "evil"}', method="POST",
                                  headers={"X-Iron-Token": dash.token, "Content-Type": "application/json"})
     with pytest.raises(urllib.error.HTTPError) as e:

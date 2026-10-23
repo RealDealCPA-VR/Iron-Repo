@@ -17,8 +17,9 @@ underneath, like every direct-API location (see [PROVIDERS](PROVIDERS.md)).
    both your own rclone and Iron's copy and prefer yours, set
    `IRON_RCLONE=rclone` or delete `~/.iron/bin/rclone`.
 2. **Offers to install rclone if it is missing.** It always asks first and
-   shows the URL and size. Without a terminal to ask in, the answer is no
-   unless you pass `--yes`. See [Download and verification](#download-and-verification).
+   shows where the download comes from; nothing is sent over the network
+   until you say yes (not even a request for the size). Without a terminal to
+   ask in, the answer is no unless you pass `--yes`. See [Download and verification](#download-and-verification).
 3. **Creates the remote** with `rclone config create <name> <type>`.
    - Google Drive, OneDrive, Dropbox, Box and pCloud use OAuth. rclone opens
      your browser, you sign in to the provider, and rclone stores the token in
@@ -29,7 +30,10 @@ underneath, like every direct-API location (see [PROVIDERS](PROVIDERS.md)).
 4. **Checks the storage** by running the provider compliance suite (the same
    one as `iron doctor --deep`) in `<name>:Iron-Repos/.connect-check`. It
    writes a few test files, reads them back, lists, deletes, and removes them
-   again. Results are reported in plain words.
+   again, together with the test folders, even if a check fails. The
+   `Iron-Repos` folder is removed too if the check created it and it is empty;
+   if it was there already (it holds your repositories) it is left alone.
+   Results are reported in plain words.
 5. **Prints the next step**, `iron setup --to <name>:`, and inside a
    repository offers to run it (default no).
 
@@ -66,13 +70,17 @@ rclone.
 
 When rclone is missing and you agree:
 
-1. Iron downloads `https://downloads.rclone.org/rclone-current-<os>-<arch>.zip`
-   (for example `windows-amd64`, `osx-arm64`, `linux-amd64`).
-2. It reads the current version from `https://downloads.rclone.org/version.txt`
-   and fetches `https://downloads.rclone.org/v<version>/SHA256SUMS`.
+1. Iron reads the current version from `https://downloads.rclone.org/version.txt`.
+2. It fetches `https://downloads.rclone.org/v<version>/SHA256SUMS` and downloads
+   the zip from the same release folder:
+   `https://downloads.rclone.org/v<version>/rclone-v<version>-<os>-<arch>.zip`
+   (for example `windows-amd64`, `osx-arm64`, `linux-amd64`). Both come from
+   one fixed release, so a new rclone release published in the middle of the
+   download cannot cause a mismatch.
 3. The SHA-256 of the zip must match the line for
    `rclone-v<version>-<os>-<arch>.zip`. If it does not match, or the file is not
-   listed, nothing is installed and the download is deleted.
+   listed, nothing is installed and the download is deleted. The size is shown
+   after the download.
 4. Only the `rclone` executable is copied out of the zip, to
    `<IRON_HOME>/bin/rclone` (`rclone.exe` on Windows). Nothing else in the
    archive is unpacked, so archive paths cannot write elsewhere.

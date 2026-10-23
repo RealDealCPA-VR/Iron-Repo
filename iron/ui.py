@@ -6,13 +6,19 @@ iron.api.Repository, iron.checkpoint and iron.maintenance.
 
 Security, because any web page the user visits can try to talk to localhost:
 
-* a random per-launch token arrives in the URL the terminal prints, is swapped
-  for an HttpOnly SameSite=Strict cookie and stripped from the address bar;
-* every request must carry that token (cookie or X-Iron-Token header);
+* a random per-launch token arrives in the URL the terminal prints. The page
+  script keeps it in memory (and in sessionStorage, which is per origin, so per
+  port, and per tab) and removes it from the address bar. There is no cookie:
+  cookies ignore the port, so a cookie would also be sent to every other
+  server on 127.0.0.1;
+* every API request (GET and POST) must carry the token in the X-Iron-Token
+  header, which a page from another origin cannot add without a CORS
+  preflight that this server never answers;
+* the page itself holds no secret and no data, so it is served without the
+  token (a reload needs that); everything it shows comes from the API;
 * the Host header must be 127.0.0.1 or localhost on our port, which defeats
   DNS rebinding;
-* every change (POST) also needs the X-Iron-Token header and a same-origin
-  Origin, so other sites cannot forge one (CSRF);
+* every change (POST) also needs a same-origin Origin (CSRF);
 * a strict Content-Security-Policy with a per-response nonce, no framing.
 """
 
@@ -25,12 +31,12 @@ import threading
 import time
 import uuid
 import webbrowser
-from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from . import gitutil
 from .api import Repository
+from .cli import iron_remotes
 from .errors import IronError
 
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
@@ -46,6 +52,16 @@ def friendly(exc):
     if isinstance(exc, IronError):
         return str(exc)
     return "Something unexpected went wrong (%s: %s)" % (type(exc).__name__, exc)
+
+
+def paths_of(items):
+    """File paths from a list of paths or of {"path": ...} dicts, without repeats."""
+    out = []
+    for item in items or []:
+        path = item.get("path") if isinstance(item, dict) else item
+        if path and str(path) not in out:
+            out.append(str(path))
+    return out
 
 
 def clean_output(text):
@@ -68,10 +84,14 @@ class Dashboard:
 
     def status(self):
         latest = self.repo.history(1)
+        changes = self.repo.changes()
+        st = self.repo.status()
+        conflicts = paths_of(st.get("conflicts", []))
+        conflicts += [c["path"] for c in changes if c["kind"] == "conflict" and c["path"] not in conflicts]
         return {"name": self.root.name, "path": str(self.root), "branch": gitutil.current_branch(self.root),
-                "remotes": self.repo.sync_state(), "changes": len(self.repo.changes()),
+                "remotes": self.repo.sync_state(), "changes": len(changes),
                 "checkpoints": len(self.repo.checkpoints()), "latest": latest[0] if latest else None,
-                "busy": self.busy_with}
+                "conflicts": conflicts, "kept_out": paths_of(st.get("kept_out", [])), "busy": self.busy_with}
 
     def changes(self):
         return {"changes": self.repo.changes(), "has_versions": bool(gitutil.head_sha(self.root))}
@@ -86,7 +106,22 @@ class Dashboard:
             n = max(1, min(int(n), 1000))
         except (TypeError, ValueError):
             raise IronError("n must be a number") from None
-        return {"history": self.repo.history(n)}
+        items = self.repo.history(n)
+        autosaved = self._autosaved(n) if items else set()
+        for item in items:
+            item["autosave"] = item["sha"] in autosaved
+        return {"history": items}
+
+    def _autosaved(self, n):
+        """Short ids of the last ``n`` versions `iron autosave` made (trailer ``Iron-Autosave: true``)."""
+        out = gitutil.git("log", "-n", str(n),
+                          "--format=%h%x00%(trailers:key=Iron-Autosave,valueonly,separator=%x2C)%x1e", cwd=self.root)
+        found = set()
+        for chunk in out.split("\x1e"):
+            sha, _, value = chunk.strip("\n").partition("\x00")
+            if sha and "true" in [v.strip().lower() for v in value.split(",")]:
+                found.add(sha)
+        return found
 
     def checkpoints(self):
         return {"checkpoints": self.repo.checkpoints()}
@@ -128,10 +163,16 @@ class Dashboard:
             raise IronError("describe what changed before saving a version")
 
         def work():
-            sha = self.repo.commit(message)
-            if sha is None:
+            result = self.repo.commit(message)
+            extra = {}
+            if isinstance(result, dict):  # tolerate a richer result from Repository.commit
+                if result.get("error"):
+                    raise IronError(str(result["error"]))
+                extra = {"kept_out": paths_of(result.get("kept_out", []))}
+                result = result.get("sha")
+            if not result:
                 raise IronError("there is nothing to save: no changes since the last version")
-            return {"sha": sha, "short": sha[:10]}
+            return dict(extra, sha=result, short=result[:10])
         return self._exclusive("saving a version", work)
 
     def checkpoint(self, message=""):
@@ -193,6 +234,13 @@ class Dashboard:
         return self._start("sync", "a sync", work, exclusive=True)
 
     def start_verify(self, remote=None, deep=False):
+        # Only this repository's own Iron remotes: a free-form location would make the
+        # server open any path it is given (on Windows a UNC path starts an SMB connection).
+        if remote is not None and not isinstance(remote, str):
+            raise IronError("say which backup to check by its name")
+        remote = (remote or "").strip() or None
+        if remote is not None and remote not in iron_remotes(self.root):
+            raise IronError("%r is not one of this repository's backups; choose one listed under Storage" % remote)
         kind = "verify-deep" if deep else "verify"
         return self._start("%s:%s" % (kind, remote or ""), "a check", lambda: dict(
             self.repo.verify(remote or None, deep=bool(deep)), remote=remote, deep=bool(deep)), exclusive=False)
@@ -234,15 +282,6 @@ class Handler(BaseHTTPRequestHandler):
     def _match(self, value):
         return bool(value) and hmac.compare_digest(value.encode("utf-8", "replace"), self.dash.token.encode())
 
-    def _cookie_token(self):
-        jar = SimpleCookie()
-        try:
-            jar.load(self.headers.get("Cookie") or "")
-        except CookieError:
-            return None
-        morsel = jar.get(self.server.cookie_name)
-        return morsel.value if morsel else None
-
     # -- replies ------------------------------------------------------------
 
     def _send(self, code, body, ctype, headers=()):
@@ -265,13 +304,24 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(data).encode("utf-8"), "application/json; charset=utf-8")
 
     def _refuse(self, why):
+        self._drain()
         self._send(403, ("Forbidden: %s\n" % why).encode(), "text/plain; charset=utf-8")
+
+    def _drain(self):
+        """Read and drop a refused request's body, so closing does not reset the connection."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if 0 < length <= MAX_BODY:
+            self.rfile.read(length)
+        self.close_connection = True
 
     def _page(self):
         nonce = secrets.token_urlsafe(16)
         csp = ("default-src 'none'; script-src 'nonce-{0}'; style-src 'nonce-{0}'; connect-src 'self'; "
                "img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'").format(nonce)
-        body = PAGE.replace("__NONCE__", nonce).replace("__TOKEN__", self.dash.token)
+        body = PAGE.replace("__NONCE__", nonce)
         self._send(200, body.encode("utf-8"), "text/html; charset=utf-8", [("Content-Security-Policy", csp)])
 
     # -- routing ------------------------------------------------------------
@@ -284,13 +334,13 @@ class Handler(BaseHTTPRequestHandler):
         url = urlsplit(self.path)
         query = {k: v[-1] for k, v in parse_qs(url.query).items()}
         if url.path == "/":
-            if self._match(query.get("token")):
-                cookie = "%s=%s; HttpOnly; SameSite=Strict; Path=/" % (self.server.cookie_name, self.dash.token)
-                return self._send(303, b"", "text/plain", [("Location", "/"), ("Set-Cookie", cookie)])
-            if not self._match(self._cookie_token()):
-                return self._refuse("open the link that `iron ui` printed in the terminal")
+            # The page is a static shell with no data and no secret: the script takes the
+            # token from ?token=, or from sessionStorage after a reload. A wrong token is
+            # refused here, so an old link says so at once.
+            if "token" in query and not self._match(query["token"]):
+                return self._refuse("this link is out of date; open the link that `iron ui` printed in the terminal")
             return self._page()
-        if not (self._match(self._cookie_token()) or self._match(self.headers.get("X-Iron-Token"))):
+        if not self._match(self.headers.get("X-Iron-Token")):
             return self._refuse("missing or wrong token")
         d = self.dash
         routes = {"/api/status": d.status, "/api/changes": d.changes, "/api/checkpoints": d.checkpoints,
@@ -359,7 +409,6 @@ def make_server(dash, port=0):
     except OSError as e:
         raise IronError("cannot listen on 127.0.0.1:%d (%s); try another --port, or leave it out" % (port, e)) from None
     server.dash = dash
-    server.cookie_name = "iron_ui_%d" % server.server_port  # cookies ignore the port, so keep instances apart
     return server
 
 
@@ -370,7 +419,7 @@ def serve(path=".", port=0, open_browser=True, out=None):
     url = "http://127.0.0.1:%d/?token=%s" % (server.server_port, dash.token)
     out("Iron dashboard for %s" % dash.root.name)
     out("  %s" % url)
-    out("  Only this computer can open it, and only with that link. Press Ctrl+C to stop.")
+    out("  Only this computer can open it, and only with that link, until you stop it. Press Ctrl+C to stop.")
     if open_browser:
         try:
             webbrowser.open(url)
@@ -390,16 +439,15 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="iron-token" content="__TOKEN__">
 <title>Iron Repository</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23333'/%3E%3Cpath d='M4 4h8v2H9v6H7V6H4z' fill='%23fff'/%3E%3C/svg%3E">
 <style nonce="__NONCE__">
 :root{--bg:#f6f7f9;--panel:#fff;--text:#1b1f24;--muted:#5f6b7a;--line:#dde1e6;--accent:#1f6feb;--accent-text:#fff;
 --ok:#1a7f37;--warn:#9a6700;--bad:#cf222e;--add-bg:#e6ffec;--add:#116329;--del-bg:#ffebe9;--del:#82071e;--hunk:#eef3fb;
---chip:#eef1f4;--shadow:0 1px 2px rgba(0,0,0,.06),0 2px 8px rgba(0,0,0,.04)}
+--chip:#eef1f4;--warn-bg:#fff8c5;--shadow:0 1px 2px rgba(0,0,0,.06),0 2px 8px rgba(0,0,0,.04)}
 @media (prefers-color-scheme:dark){:root{--bg:#0f1216;--panel:#171b21;--text:#e6e9ed;--muted:#97a2b0;--line:#2a3039;
 --accent:#4c8dff;--accent-text:#fff;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--add-bg:#12261a;--add:#7ee2a0;
---del-bg:#2d1416;--del:#ffa198;--hunk:#18233a;--chip:#222831;--shadow:none}}
+--del-bg:#2d1416;--del:#ffa198;--hunk:#18233a;--chip:#222831;--warn-bg:#2b2111;--shadow:none}}
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 button,input,textarea{font:inherit;color:inherit}
@@ -464,12 +512,22 @@ code,.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:
 .modal .row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
 pre.out{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;font-size:12px;color:var(--muted)}
 .more{margin-top:10px}
+.banner{border-radius:12px;padding:14px 18px;margin:0 0 12px;border:2px solid var(--line);word-break:break-word}
+.banner[hidden]{display:none}
+.banner.bad{border-color:var(--bad);background:var(--del-bg)}.banner.warn{border-color:var(--warn);background:var(--warn-bg)}
+.banner h2{margin:0 0 6px}.banner.bad h2{color:var(--bad)}.banner.warn h2{color:var(--warn)}
+.banner ul{margin:6px 0 8px;padding-left:20px}.banner p{margin:6px 0 0}
+.badge{font-size:11px;padding:1px 7px;border-radius:9px;background:var(--chip);color:var(--muted)}
 @media (max-width:720px){.grid{grid-template-columns:1fr}.wrap{padding:10px}header.top{padding:14px}.btn.big{width:100%}
 .diff{max-height:none}h1{font-size:21px}.list>li .btn{width:100%}}
 </style>
 </head>
 <body>
 <div class="wrap">
+  <div class="banner bad" id="gate" role="alert" hidden><h2>Open the dashboard link again</h2>
+    <p>This page needs the link that <code>iron ui</code> printed in the terminal. Copy it from there, or start the dashboard again with <code>iron ui</code>.</p></div>
+  <div class="banner bad" id="conflicts" role="alert" hidden></div>
+  <div class="banner warn" id="kept-out" role="status" hidden></div>
   <header class="top">
     <div>
       <div class="brand">IRON REPOSITORY</div>
@@ -521,9 +579,25 @@ pre.out{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;font-size:12px
 </div>
 <script nonce="__NONCE__">
 "use strict";
-const TOKEN = document.querySelector('meta[name="iron-token"]').content;
 const $ = id => document.getElementById(id);
-const state = {tab: "changes", historyN: 50, selected: null, status: null};
+const state = {tab: "changes", historyN: 50, selected: null, status: null, draft: ""};
+// The token lives in this page only: from ?token= in the link, or from sessionStorage
+// (per port and per tab) after a reload. It never goes into a cookie, and it is removed
+// from the address bar at once.
+const TOKEN = (() => {
+  let t = null;
+  try { t = new URLSearchParams(location.search).get("token"); } catch (e) {}
+  if (t) { try { sessionStorage.setItem("iron-token", t); } catch (e) {} }
+  else { try { t = sessionStorage.getItem("iron-token"); } catch (e) {} }
+  if (location.search) { try { history.replaceState(null, "", location.pathname + location.hash); } catch (e) {} }
+  return t || "";
+})();
+const EXPIRED = "This dashboard link is no longer valid (the dashboard was restarted, or the link is old). Open the link that `iron ui` printed in the terminal again.";
+function lockOut() {
+  try { sessionStorage.removeItem("iron-token"); } catch (e) {}
+  $("gate").hidden = false;
+  document.querySelectorAll("button").forEach(b => { b.disabled = true; });
+}
 
 function h(tag, attrs, ...kids) {
   const e = document.createElement(tag);
@@ -541,9 +615,11 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function api(path, body) {
   const opt = body === undefined ? {headers: {"X-Iron-Token": TOKEN}}
     : {method: "POST", headers: {"X-Iron-Token": TOKEN, "Content-Type": "application/json"}, body: JSON.stringify(body)};
+  if (!TOKEN) { lockOut(); throw new Error(EXPIRED); }
   let r;
   try { r = await fetch(path, opt); }
   catch (e) { throw new Error("The dashboard is not running any more. Start it again with: iron ui"); }
+  if (r.status === 403) { lockOut(); throw new Error(EXPIRED); }
   let data;
   try { data = await r.json(); } catch (e) { data = {error: "Unexpected reply from the dashboard (" + r.status + ")"}; }
   if (!r.ok) throw new Error(data.error || ("Error " + r.status));
@@ -565,7 +641,7 @@ function notice(kind, text, extra) {
   if (kind === "ok" && !extra) setTimeout(() => n.remove(), 8000);
   return n;
 }
-const fail = e => notice("bad", e.message || String(e));
+const fail = e => (e && e.message === EXPIRED) ? null : notice("bad", e.message || String(e));  // the banner says it
 
 function ask(title, text, yes, danger) {
   return new Promise(resolve => {
@@ -608,6 +684,23 @@ async function loadStatus() {
     : [h("div", {class: "state warn"}, "! No backup storage yet. Run `iron setup` in a terminal to add one.")]));
   $("sync").disabled = !s.remotes.length || !!s.busy;
   $("n-changes").textContent = s.changes; $("n-checkpoints").textContent = s.checkpoints;
+  showAlerts(s.conflicts || [], s.kept_out || []);
+}
+function showAlerts(conflicts, keptOut) {
+  const c = $("conflicts"), k = $("kept-out");
+  c.hidden = !conflicts.length;
+  if (conflicts.length) c.replaceChildren(
+    h("h2", {}, "These files conflict between your computers:"),
+    h("ul", {}, conflicts.map(p => h("li", {}, h("code", {}, p)))),
+    h("p", {}, "The same part of these files was changed on two computers, and Iron cannot tell which one to keep. "
+      + "Open each file, find the blocks between the lines starting with <<<<<<< and >>>>>>>, keep the text you want, "
+      + "and delete those marker lines (and the ======= line). Then save a version on the Changes tab and press Sync now."));
+  k.hidden = !keptOut.length;
+  if (keptOut.length) k.replaceChildren(
+    h("h2", {}, "Kept out because they look like secrets:"),
+    h("ul", {}, keptOut.map(p => h("li", {}, h("code", {}, p)))),
+    h("p", {}, "These files stay on this computer only: they are not saved in versions or backups, "
+      + "so they are not copied to your other computers either."));
 }
 $("sync").onclick = () => busy($("sync"), "Syncing...", async () => {
   try {
@@ -664,12 +757,18 @@ async function loadChanges() {
     d.changes.map(c => h("li", {}, h("button", {"data-path": c.path, onclick: () => showDiff(c.path), title: c.from ? "was " + c.from : null},
       h("span", {class: "kind " + c.kind}, KIND[c.kind] || c.kind), h("span", {class: "p"}, c.path)))));
   const msg = h("input", {id: "commit-msg", maxlength: "500", placeholder: "Describe what changed, e.g. “Fix the login page”", "aria-label": "Description of this version"});
+  msg.value = state.draft;
+  msg.oninput = () => { state.draft = msg.value; };
   const save = h("button", {class: "btn primary"}, "Save version");
   save.onclick = () => {
     if (!msg.value.trim()) { msg.focus(); return notice("bad", "Describe what changed before saving a version."); }
     return busy(save, "Saving...", async () => {
-      try { const r = await api("/api/commit", {message: msg.value}); notice("ok", "Saved version " + r.short + ". Use “Sync now” to back it up."); }
-      catch (e) { fail(e); }
+      try {
+        const r = await api("/api/commit", {message: msg.value});
+        state.draft = "";
+        notice("ok", "Saved version " + r.short + ". Use “Sync now” to back it up.");
+        if (r.kept_out && r.kept_out.length) notice("bad", "Not saved because they look like secrets: " + r.kept_out.join(", "));
+      } catch (e) { if (e.message !== EXPIRED) notice("bad", "The version was not saved: " + (e.message || String(e))); }
       await refresh();
     });
   };
@@ -705,7 +804,8 @@ async function loadHistory() {
   if (!d.history.length) { list.replaceChildren(h("li", {class: "empty-state"}, "No versions saved yet. Save one from the Changes tab.")); $("history-more").hidden = true; return; }
   list.replaceChildren(...d.history.map((item, i) => h("li", {},
     h("div", {class: "main"}, h("div", {class: "title"}, item.subject),
-      h("div", {class: "meta"}, who(item), h("span", {}, item.when), h("code", {title: "version id"}, item.sha), i === 0 ? h("span", {class: "ok"}, "current version") : null)),
+      h("div", {class: "meta"}, who(item), h("span", {}, item.when), h("code", {title: "version id"}, item.sha),
+        item.autosave ? h("span", {class: "badge", title: "saved automatically by iron autosave"}, "autosaved") : null, i === 0 ? h("span", {class: "ok"}, "current version") : null)),
     h("button", {class: "btn", onclick: () => restore({version: item.sha}, "version " + item.sha + " (“" + item.subject + "”)")}, "Restore files to this version"))));
   $("history-more").hidden = d.history.length < state.historyN;
 }
@@ -788,8 +888,11 @@ async function refresh() {
 }
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
 setInterval(() => { if (!document.hidden) loadStatus().catch(() => {}); }, 15000);
-loadStatus().catch(fail);
-select(LOADERS[location.hash.slice(1)] ? location.hash.slice(1) : "changes");
+if (!TOKEN) lockOut();
+else {
+  loadStatus().catch(fail);
+  select(LOADERS[location.hash.slice(1)] ? location.hash.slice(1) : "changes");
+}
 </script>
 </body>
 </html>

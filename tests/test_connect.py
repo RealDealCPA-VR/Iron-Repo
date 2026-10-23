@@ -36,6 +36,17 @@ def cenv(env, monkeypatch):
     return env
 
 
+def folders(env):
+    """Every folder in the fake cloud, relative and with forward slashes (one per remote not counted)."""
+    cloud = env / "fake-cloud"
+    out = []
+    for path in sorted(cloud.rglob("*")) if cloud.is_dir() else []:
+        rel = path.relative_to(cloud).as_posix()
+        if path.is_dir() and "/" in rel:
+            out.append(rel)
+    return out
+
+
 def remotes(env):
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.read(str(env / "rclone-config" / "rclone.conf"), encoding="utf-8")
@@ -69,14 +80,17 @@ def downloads(cenv, monkeypatch, tmp_path):
     except IronError:
         pytest.skip("no rclone build name for this platform")
     data = build_zip(system, arch)
-    state = {"requests": [], "data": data, "sha": hashlib.sha256(data).hexdigest(), "listed": True}
+    state = {"requests": [], "data": data, "sha": hashlib.sha256(data).hexdigest(), "listed": True,
+             "zip": "/v%s/rclone-v%s-%s-%s.zip" % (VERSION, VERSION, system, arch)}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def _body(self):
             if self.path == "/version.txt":
                 return b"rclone v%s\n" % VERSION.encode()
-            if self.path == "/rclone-current-%s-%s.zip" % (system, arch):
+            if self.path == state["zip"]:
                 return state["data"]
+            if self.path == "/rclone-current-%s-%s.zip" % (system, arch):
+                return b"a newer release than version.txt said: must never be used"
             if self.path == "/v%s/SHA256SUMS" % VERSION:
                 lines = ["-----BEGIN PGP SIGNED MESSAGE-----", "Hash: SHA1", "",
                          "%s  rclone-v%s-linux-mips.zip" % ("0" * 64, VERSION)]
@@ -126,7 +140,9 @@ def test_download_verifies_and_installs_only_the_binary(downloads, cenv):
     assert Path(path).read_bytes() == fake_binary()
     assert os.listdir(str(Path(path).parent)) == [os.path.basename(path)]   # no zip, docs or temp files
     assert not (cenv / "escape.txt").exists() and not (cenv / "iron-home" / "escape.txt").exists()
-    assert ("GET", "/v%s/SHA256SUMS" % VERSION) in downloads["requests"]
+    # version.txt first, then checksum and zip from that one release folder; no HEAD, no rclone-current
+    assert downloads["requests"] == [("GET", "/version.txt"), ("GET", "/v%s/SHA256SUMS" % VERSION),
+                                     ("GET", downloads["zip"])]
     if os.name != "nt":
         assert os.access(path, os.X_OK)
     assert rclone_command() == [path]   # Iron now uses it without being told
@@ -146,16 +162,25 @@ def test_unlisted_download_is_refused(downloads, cenv):
     with pytest.raises(IronError, match="not listed in the published SHA256SUMS"):
         connect.install_rclone(assume_yes=True)
     assert not Path(installed_rclone()).exists()
-    assert ("GET", "/rclone-current-%s-%s.zip" % connect.platform_tag()) not in downloads["requests"]
+    assert ("GET", downloads["zip"]) not in downloads["requests"]
 
 
-def test_no_download_without_consent(downloads, cenv):
+def test_no_download_without_consent(downloads, cenv, monkeypatch):
     with pytest.raises(IronError, match="not downloading without your go-ahead"):
         connect.install_rclone(assume_yes=False)
     assert downloads["requests"] == []          # not even a HEAD request
     out = iron(cenv, "connect", "dropbox", check=False)
-    assert out.returncode == 1 and "rclone-current-" in out.stdout and "--yes" in out.stderr
+    assert out.returncode == 1 and "--yes" in out.stderr
+    assert "/v<version>/rclone-v<version>-" in out.stdout and "/version.txt" in out.stdout   # the URL, shown first
     assert downloads["requests"] == [] and not Path(installed_rclone()).exists()
+
+    # asked in a terminal: nothing is requested before the answer, and nothing after a no
+    seen = []
+    monkeypatch.setattr(connect, "interactive", lambda: True)
+    monkeypatch.setattr(connect, "confirm", lambda *a, **k: seen.append(list(downloads["requests"])) or False)
+    with pytest.raises(IronError, match="rclone is needed"):
+        connect.install_rclone(assume_yes=False)
+    assert seen == [[]] and downloads["requests"] == []
 
 
 def test_only_https_or_this_computer(monkeypatch):
@@ -195,7 +220,7 @@ def test_connect_google_drive(cenv):
     assert "iron setup --to gdrive:" in out.stdout
     assert remotes(cenv)["gdrive"] == {"type": "drive"}
     cloud = cenv / "fake-cloud" / "gdrive" / "Iron-Repos"
-    assert not (cloud / ".connect-check").exists()          # the check cleaned up after itself
+    assert folders(cenv) == []                              # the check cleaned up after itself, folders too
 
     assert "gdrive:" in iron(cenv, "connect", "--list").stdout
     again = iron(cenv, "connect", "google-drive")
@@ -204,6 +229,10 @@ def test_connect_google_drive(cenv):
     repo = make_repo(cenv / "app")
     iron(repo, "setup", "--to", "gdrive:", "--yes")
     assert (cloud / "app.iron" / "iron.json").is_file()
+    # with repositories in Iron-Repos, a new check removes only its own folders
+    assert "All 8 checks passed" in iron(cenv, "connect", "google-drive").stdout
+    assert (cloud / "app.iron" / "iron.json").is_file()
+    assert not [f for f in folders(cenv) if ".connect-check" in f or "iron-compliance-" in f]
 
 
 def test_connect_name_conflict_and_bad_names(cenv):
@@ -225,6 +254,7 @@ def test_connect_s3_needs_keys_and_bucket(cenv):
     out = iron(cenv, "connect", "s3", "--bucket", "my-bucket", "--set", "access_key_id=AK",
                "--set", "secret_access_key=SK", "--set", "endpoint=https://minio.example.test")
     assert "All 8 checks passed" in out.stdout and "iron setup --to s3:my-bucket" in out.stdout
+    assert folders(cenv) == ["s3/my-bucket"]                # the bucket stays; the check's folders do not
     assert remotes(cenv)["s3"] == {"type": "s3", "provider": "AWS", "access_key_id": "AK",
                                    "secret_access_key": "SK", "endpoint": "https://minio.example.test"}
 
@@ -240,6 +270,22 @@ def test_failed_sign_in_is_reported(cenv, monkeypatch):
     monkeypatch.setenv("FAKE_RCLONE_FAIL_CREATE", "1")
     out = iron(cenv, "connect", "pcloud", check=False)
     assert out.returncode == 1 and "could not set up 'pcloud'" in out.stderr and "--remove pcloud" in out.stderr
+
+
+def test_cleanup_leaves_no_folders_even_when_checks_fail(cenv, monkeypatch):
+    """Through the real RcloneProvider and the fake rclone: every rmdir really runs."""
+    iron(cenv, "connect", "dropbox")
+    assert folders(cenv) == []
+    import iron.storage.compliance as compliance
+    real = compliance.run_compliance
+
+    def crashing(provider):
+        real(provider)
+        raise RuntimeError("storage went away")         # the suite crashes after its own cleanup
+    monkeypatch.setattr(connect, "run_compliance", crashing)
+    with pytest.raises(RuntimeError):
+        connect.check_remote("dropbox:" + connect.CHECK_FOLDER)
+    assert folders(cenv) == []
 
 
 def test_failing_storage_is_reported_in_plain_words(cenv, monkeypatch):
