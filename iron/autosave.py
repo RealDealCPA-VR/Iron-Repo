@@ -223,7 +223,7 @@ def sync_once(root, log, timeout=None):
     timeout = timeout or float(os.environ.get("IRON_AUTOSAVE_SYNC_TIMEOUT", "1800"))
     env = dict(gitutil.helper_env(), **{SKIP_ENV: "1"})
     try:
-        proc = subprocess.run([sys.executable, "-c", RUN_IRON, PACKAGE_PARENT, "sync"], cwd=str(root), env=env,
+        proc = subprocess.run(gitutil.iron_command() + ["sync"], cwd=str(root), env=env,
                               stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         log.info("%s Sync took longer than %d s and was stopped. Will try again next time." % (WARN, timeout), loud=True)
@@ -541,6 +541,9 @@ def _run(argv):
 
 
 def install(root, every):
+    if gitutil.is_frozen():
+        raise IronError("background autosave and autosync are not available in the standalone executable yet. "
+                        "Run `iron autosave` in a terminal, or install Iron with the one-line installer.")
     root = Path(root)
     require_iron_remote(root)
     files, commands, where, start_now = plan_install(root, every)
@@ -715,6 +718,9 @@ def hook_installed(root):
 
 
 def autosync_on(root):
+    if gitutil.is_frozen():
+        raise IronError("background autosave and autosync are not available in the standalone executable yet. "
+                        "Run `iron autosave` in a terminal, or install Iron with the one-line installer.")
     path = hook_path(root)
     block = hook_block()
     if not path.exists():

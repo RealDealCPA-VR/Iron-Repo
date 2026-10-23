@@ -108,6 +108,20 @@ def helper_dirs():
     return out
 
 
+def is_frozen():
+    """True inside a standalone executable (PyInstaller), where sys.executable is Iron itself."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def iron_command():
+    """argv prefix that runs the iron CLI in a child process, from a checkout or a standalone build."""
+    if is_frozen():
+        return [sys.executable]
+    package_parent = str(Path(__file__).resolve().parent.parent)
+    run = "import sys;sys.path.insert(0,sys.argv[1]);from iron.cli import main;sys.exit(main(sys.argv[2:]))"
+    return [sys.executable, "-c", run, package_parent]
+
+
 def helper_on_path():
     """The git-remote-iron that git itself would find on PATH, or None."""
     for d in os.environ.get("PATH", "").split(os.pathsep):

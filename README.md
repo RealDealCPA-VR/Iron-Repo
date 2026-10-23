@@ -61,27 +61,23 @@ You already pay for cloud storage. **Iron makes it a Git host.**
 - 🚚 **Move anywhere, anytime.** `iron migrate` copies a repository between
   providers, verifying every byte on both sides.
 
-## Install (30 seconds, nothing downloaded)
+## Install: one line
 
-You need [Git](https://git-scm.com/downloads) and
-[Python 3.8+](https://www.python.org/downloads/). That's the whole list.
-
-```bash
-git clone https://github.com/RealDealCPA-VR/Iron-Repo.git
-cd Iron-Repo
-```
-
+**Windows** (PowerShell):
 ```powershell
-# Windows
-powershell -ExecutionPolicy Bypass -File .\install.ps1          # add -WithEncryption for crypto
+irm https://raw.githubusercontent.com/RealDealCPA-VR/Iron-Repo/main/install.ps1 | iex
 ```
+**macOS / Linux:**
 ```bash
-# macOS / Linux
-sh install.sh                                                    # add --with-encryption for crypto
+curl -fsSL https://raw.githubusercontent.com/RealDealCPA-VR/Iron-Repo/main/install.sh | sh
 ```
 
-The installer puts `bin/` on your PATH and runs `iron doctor`. Iron runs
-straight from the folder you cloned. Prefer packages? `pipx install .` works too.
+That's it. The installer:
+- checks for Git and Python 3.8+, and **offers** to install whatever is missing (winget, brew, apt, dnf, pacman or zypper), never without asking;
+- puts Iron in a per-user folder (`%LOCALAPPDATA%\Iron` or `~/.local/share/iron`) and on your PATH;
+- runs `iron doctor`.
+
+Run it again, or `iron update`, to upgrade in place (it rolls back if the new version fails). Options, uninstalling and installing from a clone: [docs/INSTALL.md](docs/INSTALL.md).
 
 ## The 60-second tour
 
@@ -114,6 +110,50 @@ Recent changes
 ```bash
 iron clone onedrive://Iron-Repos/my-project.iron
 ```
+
+## 🖥️ Prefer clicking? `iron ui`
+
+```bash
+iron ui
+```
+
+This opens a private dashboard in your browser, served from your own computer
+and reachable only through a one-time link. It works offline and needs
+nothing installed. It has:
+- **Changes**, with a line-by-line diff and a **Save version** button;
+- **History**, with one-click **Restore files to this version**;
+- **Checkpoints**;
+- **Storage**, with a health check and a full restore test;
+- **Agents**, showing who did what.
+
+Every restore asks first and can be undone. Light and dark mode, and it works
+on a phone-sized window too. [docs/UI.md](docs/UI.md)
+
+## 💤 Forget about saving: `iron autosave`
+
+```bash
+iron autosave --install     # every 5 minutes: save what changed, then sync. Starts at login.
+iron autosync on            # or: publish every commit in the background
+```
+
+No admin rights needed. It uses a per-user Startup entry on Windows, launchd on
+macOS, and a systemd user unit or cron on Linux. It skips during merges, leaves
+secret-looking files out, keeps working offline and catches up later, and
+stops with instructions on a conflict. `iron autosave --status` shows what it
+is doing. [docs/AUTOSAVE.md](docs/AUTOSAVE.md)
+
+## ☁️ No desktop app? `iron connect`
+
+```bash
+iron connect google-drive   # or onedrive, dropbox, box, pcloud, s3, b2, webdav
+iron setup --to gdrive:
+```
+
+If rclone is missing, Iron offers to fetch the official build. It shows the URL
+and size, and verifies the published SHA-256 checksum. rclone then opens your
+browser to sign in; the token stays in rclone's config on your computer and
+Iron never sees it. Iron then runs the storage compliance suite on the new
+connection before you trust it with anything. [docs/CONNECT.md](docs/CONNECT.md)
 
 ## 🤖 Agent mode
 
@@ -200,9 +240,9 @@ That's it: about 3,500 lines of standard-library Python, with no dependencies.
 
 | | |
 |---|---|
-| ✅ Verified | Windows 11 (PowerShell, Git Bash, pip venv); folders, sync folders, a simulated rclone, and fault-injected storage; 67 automated tests, including real parallel pushes from 3 processes |
-| 🟡 Implemented, not yet run live | macOS and Linux launchers; live Google Drive, OneDrive, Dropbox, Box, S3 and WebDAV accounts through rclone |
-| ⬜ Not yet | desktop GUI (any Git GUI works meanwhile), key rotation, organization and hardware keys |
+| ✅ Verified | Windows 11 (PowerShell, Git Bash, pip venv); folders, sync folders, a simulated rclone, and fault-injected storage; automated tests including real parallel pushes from 3 processes, the installers, the dashboard's security checks, and autosave |
+| 🟡 Implemented, not yet run live | live Google Drive, OneDrive, Dropbox, Box, S3 and WebDAV accounts through rclone; the live `irm`/`curl` one-liners; real login registration for autosave |
+| ⬜ Not yet | key rotation, organization and hardware keys |
 
 Every PRD requirement, its status and the test that proves it:
 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md).
@@ -216,6 +256,10 @@ Every PRD requirement, its status and the test that proves it:
 | [PROVIDERS.md](docs/PROVIDERS.md) | storage setup, per provider |
 | [RECOVERY.md](docs/RECOVERY.md) | recovery, migration, leaving |
 | [AGENTS.md](docs/AGENTS.md) | agent mode, Python API, Claude Code hooks |
+| [INSTALL.md](docs/INSTALL.md) | one-line install, prerequisites, updating, uninstalling |
+| [UI.md](docs/UI.md) | the browser dashboard and its security model |
+| [AUTOSAVE.md](docs/AUTOSAVE.md) | automatic saving and syncing |
+| [CONNECT.md](docs/CONNECT.md) | one-command cloud connections through rclone |
 | [PRD](PRD%20Iron%20Repository.md) | the original product requirements |
 
 ## Hacking on Iron

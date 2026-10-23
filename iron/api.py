@@ -16,7 +16,6 @@ Every method returns plain dicts/lists, ready to serialize as JSON.
 
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 from . import checkpoint, gitutil, locations, maintenance
@@ -164,7 +163,7 @@ class Repository:
         here = str(Path(__file__).resolve().parent.parent)
         env = dict(gitutil.helper_env(), PYTHONIOENCODING="utf-8", GIT_TERMINAL_PROMPT="0",
                    PYTHONPATH=os.pathsep.join(p for p in (here, os.environ.get("PYTHONPATH")) if p))
-        proc = subprocess.run([sys.executable, "-m", "iron", "sync"] + ([remote] if remote else []), cwd=self.path,
+        proc = subprocess.run(gitutil.iron_command() + ["sync"] + ([remote] if remote else []), cwd=self.path,
                               env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
                               stdin=subprocess.DEVNULL)
         return {"ok": proc.returncode == 0, "output": (proc.stdout + proc.stderr).strip()}
