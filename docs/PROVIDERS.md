@@ -5,7 +5,7 @@ later with `iron migrate`.
 
 | | Sync folder | Direct API (rclone) |
 |---|---|---|
-| Setup | nothing, if the desktop app is installed | install [rclone](https://rclone.org/install/), run `rclone config` once |
+| Setup | nothing, if the desktop app is installed | `iron connect google-drive` (fetches rclone if needed, opens your browser to sign in) |
 | Works offline | yes; the app uploads later | no |
 | Simultaneous pushes from several computers | detected late (see [SPEC](SPEC.md#guarantees-and-limits)) | fully serialized |
 | Good for | one person, several computers | teams, servers, CI, headless machines |
@@ -39,6 +39,8 @@ faster for large repositories.
 **OneDrive "Files On-Demand":** works. Files download when Iron reads them.
 
 ## Direct API through rclone (no desktop app needed)
+
+The easy way is `iron connect <provider>` ([CONNECT.md](CONNECT.md)). It fetches a verified rclone if you have none, signs you in, and tests the connection. Doing it by hand also works:
 
 [rclone](https://rclone.org) is a free, open-source, single-binary client for
 about 70 storage systems. Its credentials stay in your local rclone config. If

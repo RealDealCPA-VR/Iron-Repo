@@ -11,7 +11,8 @@ into a private Git remote. No server. No account. No middleman. No lock-in.**
 ![python](https://img.shields.io/badge/python-3.8%2B-black)
 ![dependencies](https://img.shields.io/badge/runtime%20deps-zero-black)
 ![engine](https://img.shields.io/badge/engine-real%20git-black)
-![tests](https://img.shields.io/badge/tests-67%20passing-black)
+![tests](https://github.com/RealDealCPA-VR/Iron-Repo/actions/workflows/ci.yml/badge.svg)
+![platforms](https://img.shields.io/badge/CI-Windows%20%7C%20macOS%20%7C%20Linux-black)
 
 </div>
 
@@ -118,7 +119,7 @@ iron ui
 ```
 
 This opens a private dashboard in your browser, served from your own computer
-and reachable only through a one-time link. It works offline and needs
+and reachable only through a private link that works until you stop it. It works offline and needs
 nothing installed. It has:
 - **Changes**, with a line-by-line diff and a **Save version** button;
 - **History**, with one-click **Restore files to this version**;
@@ -227,7 +228,7 @@ It then appends a tiny record (*"main moved from a1b2 to c3d4"*) to an
 append-only log, using a write → list → confirm protocol that makes
 concurrent pushes safe on storage that has no locking or atomic operations at
 all. `git fetch` replays the log and downloads only the bundles it hasn't seen.
-That's it: about 3,500 lines of standard-library Python, with no dependencies.
+That's it: about 6,000 lines of standard-library Python, with no dependencies.
 
 ```
  you / agents / IDEs ──► git ──► git-remote-iron ──► push log + bundles ──► StorageProvider
@@ -240,7 +241,7 @@ That's it: about 3,500 lines of standard-library Python, with no dependencies.
 
 | | |
 |---|---|
-| ✅ Verified | Windows 11 (PowerShell, Git Bash, pip venv); folders, sync folders, a simulated rclone, and fault-injected storage; automated tests including real parallel pushes from 3 processes, the installers, the dashboard's security checks, and autosave |
+| ✅ Verified | CI on Windows, macOS and Linux (Python 3.8/3.9 and 3.13); standalone executables built and smoke-tested on all three, including a Linux machine with no Python at all; folders, sync folders, a simulated rclone, and fault-injected storage; real parallel pushes from 3 processes; the installers; the dashboard's security checks; autosave |
 | 🟡 Implemented, not yet run live | live Google Drive, OneDrive, Dropbox, Box, S3 and WebDAV accounts through rclone; the live `irm`/`curl` one-liners; real login registration for autosave |
 | ⬜ Not yet | key rotation, organization and hardware keys |
 
@@ -260,13 +261,14 @@ Every PRD requirement, its status and the test that proves it:
 | [UI.md](docs/UI.md) | the browser dashboard and its security model |
 | [AUTOSAVE.md](docs/AUTOSAVE.md) | automatic saving and syncing |
 | [CONNECT.md](docs/CONNECT.md) | one-command cloud connections through rclone |
+| [PLATFORMS.md](docs/PLATFORMS.md) | CI coverage and the standalone executables |
 | [PRD](PRD%20Iron%20Repository.md) | the original product requirements |
 
 ## Hacking on Iron
 
 ```bash
 python -m pip install pytest cryptography
-python -m pytest            # 67 tests, a few minutes
+python -m pytest            # 120+ tests, 10-20 minutes
 ```
 
 ```
@@ -280,7 +282,13 @@ iron/
   checkpoint.py      checkpoints and restore
   maintenance.py     verify, migrate, compact
   cli.py, api.py     the iron command and the agent API
-tests/            protocol, git end to end, CLI, storage compliance
+  ui.py              iron ui: the local browser dashboard
+  autosave.py        iron autosave / autosync
+  connect.py         iron connect: guided rclone setup
+  update.py          iron update
+packaging/        PyInstaller builds of standalone executables
+.github/workflows/  CI on three OSes, and the standalone builds
+tests/            protocol, git end to end, CLI, storage, installers, ui, autosave, connect
 ```
 
 <div align="center">

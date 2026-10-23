@@ -122,8 +122,8 @@ Tests live in `tests/`: `P` = test_protocol.py, `G` = test_git_remote.py,
 
 | Requirement | Status | Notes |
 |---|---|---|
-| Simple dashboard: branch, sync state, recent changes, actions | Partial | `iron` with no arguments prints the PRD's layout in the terminal (C `test_setup_from_a_plain_folder`). Git terminology is hidden in Iron's own commands (`changes`, `history`, `sync`, `restore`). |
-| Desktop application: history, diff and branch views; restore UI; storage config; conflict resolution; migration; agent activity | Not done | Any Git GUI (VS Code, GitHub Desktop, Fork) already works against Iron repositories. A native app can be built on `iron.api`. |
+| Simple dashboard: branch, sync state, recent changes, actions | Done | `iron ui` (browser dashboard, local only) and `iron` (terminal). Previously: `iron` with no arguments prints the PRD's layout in the terminal (C `test_setup_from_a_plain_folder`). Git terminology is hidden in Iron's own commands (`changes`, `history`, `sync`, `restore`). |
+| Desktop application: history, diff and branch views; restore UI; storage config; conflict resolution; migration; agent activity | Partial | `iron ui` covers changes and diffs, history, restore, checkpoints, storage health and verification, and agent activity (tests/test_ui.py). Not in the dashboard yet: branch management, migration, and editing conflicts in place. | Any Git GUI (VS Code, GitHub Desktop, Fork) already works against Iron repositories. A native app can be built on `iron.api`. |
 
 ## Provider migration (PRD §18)
 
@@ -147,7 +147,7 @@ Tests live in `tests/`: `P` = test_protocol.py, `G` = test_git_remote.py,
 | 5 Same compliance suite for every provider | Done | `iron/storage/compliance.py`, `iron doctor --deep` |
 | 6 Agent integration | Done, except IJ | see above |
 | 7 Encryption | Partial | see above |
-| 8 Desktop app | Not done | terminal dashboard only |
+| 8 Desktop app | Partial | `iron ui` browser dashboard (see above) |
 | 9 Sovereignty: Git import and export, migration, offline export, verification, disaster recovery, zero-provider mode, public spec | Done | C `test_recovery_without_iron`, `test_export_is_restorable_by_plain_git`, `test_verify_*`; zero-provider mode is plain Git |
 
 ## Definition of done (PRD §21)
@@ -174,6 +174,6 @@ readable by plain `git`. See [RECOVERY.md](RECOVERY.md).
 
 | Requirement | How |
 |---|---|
-| Extremely easy setup | Two prerequisites (Git and Python). The installer downloads nothing. `iron setup` detects storage, asks one question, adds a starter `.gitignore` and stops if files look like secrets (C `test_setup_keeps_secrets_out`). `iron doctor` explains anything missing. |
-| Portable | Pure Python standard library; zero-install launchers for cmd/PowerShell (`iron.cmd`) and POSIX shells (`iron`, `git-remote-iron`); `.gitattributes` keeps launchers LF; also installable with pip or pipx. **Verified on Windows 11** (PowerShell, Git Bash, pip venv). The macOS and Linux code paths are standard POSIX but have not yet been run on those systems. |
+| Extremely easy setup | One line (`irm … \| iex` or `curl … \| sh`) installs Iron and offers to install a missing Git or Python; run from a clone, the installer downloads nothing (tests/test_install.py). `iron setup` detects storage, asks one question, adds a starter `.gitignore` and stops if files look like secrets (C `test_setup_keeps_secrets_out`). `iron doctor` explains anything missing. |
+| Portable | Pure Python standard library; zero-install launchers for cmd/PowerShell (`iron.cmd`) and POSIX shells (`iron`, `git-remote-iron`); `.gitattributes` keeps launchers LF; also installable with pip or pipx; standalone executables need no Python. **Verified by CI on Windows, macOS and Linux**, and the standalone builds were smoke-tested on all three ([PLATFORMS](PLATFORMS.md)). |
 | Sovereign | No server and no account; works offline with folder remotes; credentials stay with the sync app or rclone; Iron never sees them |

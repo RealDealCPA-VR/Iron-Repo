@@ -100,3 +100,7 @@ Checked and found fine: the `sh` launchers (LF endings are enforced by
 Not covered: Linux on arm64, Intel macOS, and Windows on arm64 have no
 standalone build yet; real cloud providers (rclone) are exercised only through
 the fake rclone in the tests.
+
+## Limits of the standalone executables
+
+`iron autosave --install` and `iron autosync on` are not available in the standalone executable yet: they write small Python launcher scripts. Run `iron autosave` in a terminal instead, or install with the one-line installer, which uses Python.

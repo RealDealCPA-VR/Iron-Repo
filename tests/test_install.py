@@ -337,7 +337,7 @@ def test_update_swaps_in_a_newer_archive(env, world, source_tar, fmt):
     # with no IRON_INSTALL_URL, the next update uses the URL the copy came from
     del world["IRON_INSTALL_URL"]
     out = run([sys.executable, str(install_dir / "bin" / "iron_launch.py"), "cli", "update"], env, env=world).stdout
-    assert "9.9.4 -> 9.9.4 (already the latest version)" in out
+    assert "Iron 9.9.4 is already up to date" in out
 
 
 def test_update_keeps_the_old_copy_when_the_new_one_is_broken(env, world, source_tar):

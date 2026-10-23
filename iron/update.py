@@ -6,6 +6,7 @@ to the old copy, must answer ``iron --version``, and only then swapped in; the o
 until the new one runs from its final place.
 """
 
+import hashlib
 import os
 import shutil
 import stat
@@ -229,12 +230,27 @@ def update_archive(root):
         _rmtree(work)
 
 
+def fingerprint(root):
+    """What is installed, beyond the version number: the commit, or a hash of the code."""
+    root = Path(root)
+    if (root / ".git").exists():
+        proc = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True)
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+    digest = hashlib.sha256()
+    for path in sorted((root / "iron").rglob("*.py")):
+        digest.update(path.relative_to(root).as_posix().encode() + b"|" + path.read_bytes())
+    return digest.hexdigest()
+
+
 def cmd_update(_a):
     root = install_root()
-    old = __version__
+    old, before = __version__, fingerprint(root)
     new = update_checkout(root) if (root / ".git").exists() else update_archive(root)
-    if new == old:
-        say("%s Iron %s -> %s (already the latest version)" % (OK, old, new))
+    if fingerprint(root) == before:
+        say("%s Iron %s is already up to date" % (OK, old))
+    elif new == old:
+        say("%s Updated Iron %s to the latest build" % (OK, old))
     else:
         say("%s Updated Iron %s -> %s" % (OK, old, new))
     return 0
