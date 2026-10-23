@@ -13,6 +13,7 @@ into a private Git remote. No server. No account. No middleman. No lock-in.**
 ![engine](https://img.shields.io/badge/engine-real%20git-black)
 ![tests](https://github.com/RealDealCPA-VR/Iron-Repo/actions/workflows/ci.yml/badge.svg)
 ![platforms](https://img.shields.io/badge/CI-Windows%20%7C%20macOS%20%7C%20Linux-black)
+[![release](https://img.shields.io/github/v/release/RealDealCPA-VR/Iron-Repo?color=black)](https://github.com/RealDealCPA-VR/Iron-Repo/releases/latest)
 
 </div>
 
@@ -79,6 +80,21 @@ That's it. The installer:
 - runs `iron doctor`.
 
 Run it again, or `iron update`, to upgrade in place (it rolls back if the new version fails). Options, uninstalling and installing from a clone: [docs/INSTALL.md](docs/INSTALL.md).
+
+**No Python? Download a standalone build.** It needs only Git, and encryption is included.
+
+| [Latest release](https://github.com/RealDealCPA-VR/Iron-Repo/releases/latest) | |
+|---|---|
+| Windows 10/11 x64 | `iron-<version>-windows-x64.zip` |
+| macOS, Apple silicon | `iron-<version>-macos-arm64.tar.gz` (clear the quarantine flag once: `xattr -d com.apple.quarantine iron git-remote-iron`) |
+| Linux x86-64 (glibc 2.35+) | `iron-<version>-linux-x64.tar.gz` |
+
+To install one:
+1. Unpack it.
+2. Put `iron` and `git-remote-iron` in one folder on your PATH.
+3. Run `iron doctor`.
+
+Checksums are in `SHA256SUMS` on the release page.
 
 ## The 60-second tour
 
