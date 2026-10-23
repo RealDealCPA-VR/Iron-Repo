@@ -40,6 +40,7 @@ Everyday
   iron changes               what changed since the last commit
   iron commit -am "msg"      save a version (any git command works: log, diff, branch, ...)
   iron history               recent versions, with which agent made them
+  iron ui [--port N] [--no-browser]   the same in your browser: changes, history, restore, storage
 
 Safety net
   iron checkpoint [-m msg]   snapshot everything right now, without committing
@@ -753,6 +754,11 @@ def cmd_doctor(a):
     return 0 if good else 1
 
 
+def cmd_ui(a):
+    from .ui import serve
+    return serve(port=a.port, open_browser=not a.no_browser)
+
+
 # -- dispatch -----------------------------------------------------------------
 
 def build_parsers():
@@ -841,6 +847,10 @@ def build_parsers():
     p = parser("unlock", cmd_unlock)
     p.add_argument("remote", nargs="?")
     p.add_argument("--yes", "-y", action="store_true")
+
+    p = parser("ui", cmd_ui, description="A dashboard in your browser, on this computer only.")
+    p.add_argument("--port", type=int, default=0, help="port on 127.0.0.1 (default: any free one)")
+    p.add_argument("--no-browser", action="store_true", help="print the link instead of opening a browser")
 
     p = parser("doctor", cmd_doctor)
     p.add_argument("--deep", action="store_true", help="run the provider compliance suite on each remote")
