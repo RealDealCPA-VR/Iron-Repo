@@ -210,6 +210,10 @@ def update_checkout(root):
     if proc.returncode != 0:
         raise IronError("`git pull --ff-only` failed in %s (local changes, or a branch that diverged?). "
                         "Sort it out there, or reinstall with:  %s" % (root, reinstall_hint()))
+    # A pull within the same second as the last run can leave .pyc files that Python's
+    # mtime+size check still trusts, so the old code would keep running.
+    for cache in Path(root).rglob("__pycache__"):
+        shutil.rmtree(cache, ignore_errors=True)
     return installed_version(root)
 
 
