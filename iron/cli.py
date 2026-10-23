@@ -44,24 +44,25 @@ Everyday
   iron changes               what changed since the last commit
   iron commit -am "msg"      save a version (any git command works: log, diff, branch, ...)
   iron history               recent versions, with which agent made them
-  iron ui [--port N] [--no-browser]   the same in your browser: changes, history, restore, storage
+  iron ui                    the same in your browser: changes, history, restore, storage
   iron autosave [--every 5m] save and sync automatically (--install: in the background at login)
   iron autosync on|off       publish every commit in the background
 
 Safety net
   iron checkpoint [-m msg]   snapshot everything right now, without committing
   iron checkpoints           list checkpoints
-  iron restore <id|last|commit>   put files back exactly as they were (saves a checkpoint first)
-  iron agent [--test CMD] -- <command>   run an AI agent with automatic checkpoint, test and rollback
+  iron restore <id|last>     put files back exactly as they were (saves a checkpoint first)
+  iron agent -- <command>    run an AI agent with checkpoint, --test validation and rollback
 
 Storage and sovereignty
-  iron remote add <name> <location> [--encrypt]   e.g. onedrive://Iron-Repos/app.iron, D:/Backup/app.iron
+  iron init [--remote LOC]   start a repository here (iron setup does this for you)
+  iron remote add NAME LOC   add storage, e.g. onedrive://Iron-Repos/app.iron (--encrypt)
   iron where                 where each remote lives, and whether it is reachable
   iron verify [--deep]       prove the remote alone can rebuild every commit
   iron migrate <to>          move the repository to other storage, verified
   iron export [file]         one-file backup that plain git can restore
   iron compact               speed up future clones (nothing is deleted)
-  iron key show|import       the recovery key of an encrypted remote
+  iron key show|import|path  the recovery key of an encrypted remote
   iron unlock                clear a lock left by a crashed device
 
 Locations: any folder path, onedrive://..., google-drive://..., dropbox://..., box://...,
@@ -887,7 +888,7 @@ def cmd_doctor(a):
     line(crypto_available(), "encryption support" + ("" if crypto_available() else
          " (optional: python -m pip install cryptography)"), optional=True)
     line(rclone_available(), "rclone" + ("" if rclone_available() else
-         " (optional, for direct cloud APIs: %s)" % (install_hint("rclone") or "https://rclone.org/install/")), optional=True)
+         " (optional, for direct cloud APIs: `iron connect <provider>` sets it up)"), optional=True)
     dests = locations.detect_destinations()
     say("Storage found on this computer: %s" % (", ".join("%s (%s)" % (d.label, d.location) for d in dests) or "none"))
     if gitutil.in_worktree():

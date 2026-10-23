@@ -58,7 +58,10 @@ def install_hint(tool):
         managers = ["apt-get", "dnf", "pacman", "zypper", "brew"]
     for manager in managers:
         if shutil.which(manager):
-            return PACKAGES[tool][manager]
+            hint = PACKAGES[tool][manager]
+            if hint.startswith("sudo ") and getattr(os, "geteuid", lambda: 1)() == 0:
+                hint = hint[len("sudo "):]  # already root, like the installer
+            return hint
     return None
 
 

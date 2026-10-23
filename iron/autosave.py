@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import checkpoint, gitutil, keys, locks
-from .cli import (BAD, OK, UNMERGED, WARN, SecretsStaged, conflict_banner, iron_remotes, kept_out_line, say,
+from .cli import (BAD, OK, UNMERGED, WARN, SecretsStaged, conflict_banner, iron_remotes, kept_out_line, say,  # noqa: F401
                   secret_files, stage_changes, status_entries, unmerged_files)  # noqa: F401 - re-exported
 from .errors import IronError
 
