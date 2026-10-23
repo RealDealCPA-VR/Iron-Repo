@@ -1,5 +1,6 @@
 """Every provider passes the same compliance suite (PRD Phase 5)."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -54,7 +55,8 @@ def test_resolve_location(env, monkeypatch):
     assert locations.resolve_location("google-drive://Iron-Repos/app.iron") == "rclone:mydrive:Iron-Repos/app.iron"
     assert locations.resolve_location("mydrive:work/app.iron") == "rclone:mydrive:work/app.iron"
     assert locations.resolve_location("onedrive://Iron-Repos/app.iron") == (env / "OneDrive" / "Iron-Repos" / "app.iron").as_posix()
-    assert locations.resolve_location("C:/x/y.iron") == "C:/x/y.iron"
+    absolute = "C:/x/y.iron" if os.name == "nt" else "/x/y.iron"  # "C:/x" is a relative path on POSIX
+    assert locations.resolve_location(absolute) == absolute
     with pytest.raises(IronError, match="No Dropbox"):
         locations.resolve_location("dropbox://Iron-Repos/app.iron")
     assert locations.container_for("onedrive", "app") == (env / "OneDrive" / "Iron-Repos" / "app.iron").as_posix()
